@@ -1,0 +1,58 @@
+partial module adm.interop.js {
+	use std.errors
+
+	// What a JavaScript value is.
+	enum Kind {
+		Undefined,
+		Null,
+		Bool,
+		Number,
+		BigInt,
+		String,
+		Symbol,
+		Object,
+		Array,
+		Function,
+		Error,
+		Promise,
+		// An ArrayBuffer, a typed array or a DataView.
+		Bytes,
+		Date,
+		// An ADM object the script holds without seeing inside it.
+		Foreign
+	}
+
+	// Why a script failed.
+	enum ScriptFailure {
+		// The script threw.
+		Thrown,
+		// Runtime.interrupt stopped it.
+		Interrupted,
+		// It ran longer than the runtime's timeout.
+		TimedOut,
+		// It needed more memory than the runtime's limit.
+		OutOfMemory,
+		// The runtime is closed.
+		Closed,
+		// A value was not what the caller asked for.
+		Conversion
+	}
+
+	// ScriptError is the failure of a script or of a conversion. A handler
+	// that narrows with `err is ScriptError` reads `kind`, the JavaScript
+	// error's `name` and stack (`trace`), and the thrown value itself.
+	struct ScriptError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ScriptFailure
+		// The JavaScript error's name ("TypeError"); "" when the script threw
+		// something that is not an Error.
+		name    string
+		// The JavaScript stack, one frame per line; "" when there is none.
+		trace   string
+		// What the script threw; none for failures that are not exceptions.
+		value   ?Value
+	}
+}

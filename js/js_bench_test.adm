@@ -1,0 +1,72 @@
+partial module adm.interop.js {
+	use std.testing
+
+	// What a call across the boundary costs, each way. Run with
+	// `adm test --release --bench .`.
+	check "Benchmarks" {
+		let js = new Runtime()
+		let increment ?Value = none
+		let loop ?Value = none
+
+		// The script function x => x + 1, made once.
+		def incrementFunction() !Value {
+			let known = increment
+			if known is none {
+				let made = try js.eval("x => x + 1")
+				increment = made
+				return made
+			}
+			return known
+		}
+
+		// A script function calling the host function `echo` n times, made once.
+		def loopFunction() !Value {
+			let known = loop
+			if known is none {
+				try (try js.global()).set("echo", try js.function("echo", def (args Value[]) !Value {
+					return args[0]
+				}))
+				let made = try js.eval("n => \{ for (let i = 0; i < n; i++) echo(i) \}")
+				loop = made
+				return made
+			}
+			return known
+		}
+
+		@benchmark()
+		def number_to_script() !none {
+			let _ = try js.value(42)
+			return none
+		}
+
+		@benchmark()
+		def call_script_function() !none {
+			let _ = try (try incrementFunction()).call(41)
+			return none
+		}
+
+		@benchmark()
+		def call_and_read_result() !none {
+			let _ = try (try (try incrementFunction()).call(41)).asInt()
+			return none
+		}
+
+		@benchmark()
+		def thousand_host_calls_from_script() !none {
+			try (try loopFunction()).call(1000)
+			return none
+		}
+
+		@benchmark()
+		def eval_small_script() !none {
+			let _ = try js.eval("1 + 2")
+			return none
+		}
+
+		@benchmark()
+		def read_property() !none {
+			let _ = try (try js.global()).get("Math")
+			return none
+		}
+	}
+}

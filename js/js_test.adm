@@ -1,0 +1,483 @@
+partial module adm.interop.js {
+	use (
+		std.errors
+		std.testing
+		std.time
+	)
+
+	// An ADM error with a payload, to check it survives a trip through a script.
+	internal struct QuotaError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		used    int
+	}
+
+	internal struct Account {
+		owner   string
+		balance float
+		tags    string[]
+	}
+
+	// The failure of a call that must fail, as a ScriptError.
+	internal def failureOf(js Runtime, code string) !ScriptError {
+		let found ?ScriptError = none
+		js.eval(code) onerror (err error) {
+			found = err when err is ScriptError
+			recover try js.undefined()
+		}
+		fail "the script did not fail: {code}" when found is none
+		return found
+	}
+
+	// Calls the script function `spin` a number of times from its own task.
+	internal async def hammer(js Runtime, rounds int) !int {
+		let spin = try js.eval("spin")
+		let total = 0
+		for let i = 0; i < rounds; i++ {
+			total += try (try spin.call(i)).asInt()
+		}
+		return total
+	}
+
+	// Interrupts the runtime after a pause.
+	internal async def interruptLater(js Runtime, pause duration) {
+		time.sleep(pause)
+		js.interrupt()
+	}
+
+	// Hands the script an ADM object and drops the handle to it.
+	internal def lendAccount(js Runtime) !none {
+		let held = try js.foreign(Account{owner: "Bob", balance: 2.0, tags: []})
+		assert held.kind() == Kind.Foreign
+		return none
+	}
+
+	check "Runtime" {
+		@test()
+		def evaluates_scalars() !none {
+			let js = new Runtime()
+			assert try (try js.eval("1 + 2")).asInt() == 3
+			assert try (try js.eval("1.5 * 2")).asFloat() == 3.0
+			assert try (try js.eval("'a' + 'b'")).asString() == "ab"
+			assert try (try js.eval("3 > 2")).asBool()
+			assert (try js.eval("undefined")).isNone()
+			assert (try js.eval("null")).kind() == Kind.Null
+			assert try (try js.eval("[1,2,3].map(x => x * 2).join('-')")).asString() == "2-4-6"
+			assert try (try js.eval("2n ** 62n")).asInt() == 4611686018427387904
+			assert (try js.eval("'héllo wörld'")).str().len() == 11
+			return none
+		}
+
+		@test()
+		def refuses_wrong_conversions() !none {
+			let js = new Runtime()
+			let text = try js.eval("'12'")
+			let asNumber = text.asInt() onerror recover -1
+			assert asNumber == -1
+			let fraction = (try js.eval("1.5")).asInt() onerror recover -1
+			assert fraction == -1
+			let huge = (try js.eval("2n ** 80n")).asInt() onerror recover -1
+			assert huge == -1
+			let notBool = (try js.eval("1")).asBool() onerror recover false
+			assert !notBool
+			assert (try js.eval("1")).truthy()
+			let symbol = (try js.eval("Symbol('s')")).text() onerror recover "refused"
+			assert symbol == "refused"
+			return none
+		}
+
+		@test()
+		def converts_adm_values() !none {
+			let js = new Runtime()
+			assert try (try js.value(42)).asInt() == 42
+			assert (try js.value(9007199254740993)).kind() == Kind.BigInt
+			assert try (try js.value(9007199254740993)).asInt() == 9007199254740993
+			assert try (try js.value(2.5)).asFloat() == 2.5
+			assert try (try js.value("héllo")).asString() == "héllo"
+			assert try (try js.value(true)).asBool()
+			let numbers int[] = [1, 2, 3]
+			let list = try js.value(numbers)
+			assert list.kind() == Kind.Array
+			assert try list.json() == "[1,2,3]"
+			let table map<string, string>
+			table["a"] = "x"
+			table["b"] = "y"
+			assert try (try js.value(table)).json() == "\{\"a\":\"x\",\"b\":\"y\"\}"
+			let account = Account{owner: "Ada", balance: 12.5, tags: ["a", "b"]}
+			assert try (try js.copy(account)).json() == "\{\"owner\":\"Ada\",\"balance\":12.5,\"tags\":[\"a\",\"b\"]\}"
+			assert try (try js.parse("\{\"n\": [1, \{\"k\": null\}]\}")).json() == "\{\"n\":[1,\{\"k\":null\}]\}"
+			let bad = js.parse("\{nope") onerror recover try js.undefined()
+			assert bad.isNone()
+			return none
+		}
+
+		@test()
+		def reads_and_writes_objects() !none {
+			let js = new Runtime()
+			let user = try js.eval("(\{ name: 'Ada', langs: ['adm', 'js'], greet(who) \{ return this.name + ' greets ' + who \} \})")
+			assert user.kind() == Kind.Object
+			assert try (try user.get("name")).asString() == "Ada"
+			let langs = try user.get("langs")
+			assert try langs.len() == 2
+			assert try (try langs.get(1)).asString() == "js"
+			assert (try user.get("missing")).kind() == Kind.Undefined
+			try user.set("age", 36)
+			try langs.set(2, "c")
+			assert try user.has("age")
+			assert !(try user.has("nope"))
+			assert (try user.keys()).join(",") == "name,langs,greet,age"
+			assert try user.remove("age")
+			assert !(try user.has("age"))
+			assert try (try user.invoke("greet", "Bob")).asString() == "Ada greets Bob"
+			let failed = (try js.undefined()).get("x") onerror recover try js.null()
+			assert failed.kind() == Kind.Null
+			let global = try js.global()
+			try global.set("answer", 42)
+			assert try (try js.eval("answer + 1")).asInt() == 43
+			return none
+		}
+
+		@test()
+		def calls_functions() !none {
+			let js = new Runtime()
+			let add = try js.eval("(a, b) => a + b")
+			assert add.kind() == Kind.Function
+			assert try (try add.call(2, 3)).asInt() == 5
+			assert try (try add.call("a", "b")).asString() == "ab"
+			assert try (try add.call(try js.value(1.5), 1)).asFloat() == 2.5
+			let point = try js.eval("(class Point \{ constructor(x, y) \{ this.x = x; this.y = y \} norm() \{ return Math.hypot(this.x, this.y) \} \})")
+			let p = try point.construct(3, 4)
+			assert try (try p.invoke("norm")).asFloat() == 5.0
+			let notCallable = (try js.eval("42")).call() onerror recover try js.undefined()
+			assert notCallable.isNone()
+			let day = try js.date(86400000.0)
+			assert day.kind() == Kind.Date
+			assert try (try day.invoke("toISOString")).asString() == "1970-01-02T00:00:00.000Z"
+			assert (try js.bigint(7)).kind() == Kind.BigInt
+			assert (try js.eval("x => x")).same(try js.eval("1")) == false
+			return none
+		}
+
+		@test()
+		def reports_script_errors() !none {
+			let js = new Runtime()
+			let thrown = try failureOf(js, "function boom() \{ throw new TypeError('bad thing') \}\nboom()")
+			assert thrown.kind == ScriptFailure.Thrown
+			assert thrown.name == "TypeError"
+			assert thrown.message == "js: TypeError: bad thing"
+			assert thrown.trace.contains("boom")
+			let syntax = try failureOf(js, "let = ;")
+			assert syntax.name == "SyntaxError"
+			let plain = try failureOf(js, "throw 'just text'")
+			assert plain.name == ""
+			assert plain.message == "js: just text"
+			let value = plain.value
+			fail "the thrown value is missing" when value is none
+			assert value.kind() == Kind.String
+			return none
+		}
+
+		@test()
+		def scripts_call_host_functions() !none {
+			let js = new Runtime()
+			let calls = 0
+			let add = try js.function("add", def (args Value[]) !Value {
+				calls++
+				return try js.value(try args[0].asInt() + try args[1].asInt())
+			}, 2)
+			let global = try js.global()
+			try global.set("add", add)
+			assert try (try js.eval("add(2, 3) + add(10, 20)")).asInt() == 35
+			assert calls == 2
+			assert try (try js.eval("add.name + add.length")).asString() == "add2"
+
+			try global.set("count", try js.function("count", def (args Value[]) !Value {
+				let total = 0
+				for let (_, a) in args {
+					total += try a.asInt()
+				}
+				return try js.value(total)
+			}))
+			assert try (try js.eval("count(1, 2, 3, 4, 5, 6, 7)")).asInt() == 28
+			assert try (try js.eval("count()")).asInt() == 0
+
+			try global.set("nothing", try js.function("nothing", def (args Value[]) !Value {
+				return try js.undefined()
+			}))
+			assert try (try js.eval("typeof nothing(1)")).asString() == "undefined"
+
+			try global.set("twice", try js.function("twice", def (args Value[]) !Value {
+				return try args[0].call(try args[0].call(1))
+			}))
+			assert try (try js.eval("twice(x => x * 10)")).asInt() == 100
+			return none
+		}
+
+		@test()
+		def host_errors_cross_the_script() !none {
+			let js = new Runtime()
+			let global = try js.global()
+			try global.set("spend", try js.function("spend", def (_ Value[]) !Value {
+				fail QuotaError{message: "quota used up", code: "quota", used: 7}
+			}))
+			let used = 0
+			let message = ""
+			js.eval("spend()") onerror (err error) {
+				message = err.message
+				used = err.used when err is QuotaError
+				recover try js.undefined()
+			}
+			assert used == 7
+			assert message == "quota used up"
+			assert try (try js.eval("try \{ spend() \} catch (e) \{ e.message \}")).asString() == "quota used up"
+
+			try global.set("rethrow", try js.function("rethrow", def (args Value[]) !Value {
+				return try args[0].call()
+			}))
+			let seen = try js.eval("try \{ rethrow(() => \{ throw new RangeError('inner') \}) \} catch (e) \{ e.name + ':' + e.message \}")
+			assert try seen.asString() == "RangeError:inner"
+			return none
+		}
+
+		@test()
+		def loads_modules() !none {
+			let js = new Runtime()
+			js.define("shapes.js", "export const sides = \{ square: 4 \}; export function area(w, h) \{ return w * h \}")
+			let app = try js.load("app.js", "import \{ area, sides \} from 'shapes.js'; export const total = area(3, 4) + sides.square; export default 'ready'")
+			assert try (try app.get("total")).asInt() == 16
+			assert try (try js.get("app.js", "default")).asString() == "ready"
+			assert (try js.load("app.js")).same(app)
+			let area = try (try js.load("shapes.js")).get("area")
+			assert try (try area.call(5, 6)).asInt() == 30
+
+			let waited = try js.load("late.js", "export const v = await Promise.resolve(7)")
+			assert try (try waited.get("v")).asInt() == 7
+
+			let missing = ""
+			js.load("broken.js", "import 'nowhere.js'") onerror (err error) {
+				missing = err.message
+				recover try js.undefined()
+			}
+			assert missing.contains("nowhere.js")
+			let unloaded = js.get("ghost.js", "x") onerror recover try js.null()
+			assert unloaded.kind() == Kind.Null
+			return none
+		}
+
+		@test()
+		def settles_promises() !none {
+			let js = new Runtime()
+			let p = try js.eval("(async () => \{ await null; return 'done' \})()")
+			assert p.kind() == Kind.Promise
+			assert p.state() == PromiseState.Pending
+			assert try (try p.wait()).asString() == "done"
+			assert p.state() == PromiseState.Fulfilled
+
+			let rejected = try js.eval("Promise.reject(new Error('nope'))")
+			let reason = ""
+			rejected.wait() onerror (err error) {
+				reason = err.message
+				recover try js.undefined()
+			}
+			assert reason == "js: Error: nope"
+			assert rejected.state() == PromiseState.Rejected
+
+			let never = try js.eval("new Promise(() => \{\})")
+			let stuck = ""
+			never.wait() onerror (err error) {
+				stuck = err.code
+				recover try js.undefined()
+			}
+			assert stuck == "pending"
+			assert try (try (try js.value(5)).wait()).asInt() == 5
+			return none
+		}
+
+		@test()
+		def compiles_to_bytecode() !none {
+			let js = new Runtime()
+			let script = try js.compile("[1, 2, 3].reduce((a, b) => a + b)")
+			assert script.len() > 0
+			let other = new Runtime()
+			assert try (try other.run(script)).asInt() == 6
+			let unit = try js.compile("export const greeting = 'hi'", "unit.js", isModule = true, strip = true)
+			let namespace = try other.run(unit)
+			assert try (try namespace.get("greeting")).asString() == "hi"
+			let broken = js.compile("let = ;") onerror recover byte[]
+			assert broken.len() == 0
+			return none
+		}
+
+		@test()
+		def moves_bytes() !none {
+			let js = new Runtime()
+			let copy = try js.bytes(byte[1, 2, 3])
+			assert copy.kind() == Kind.Bytes
+			assert (try copy.asBytes()).hex() == "010203"
+			assert (try (try js.eval("new Uint16Array([258, 772]).subarray(1)")).asBytes()).hex() == "0403"
+			assert (try (try js.eval("new ArrayBuffer(2)")).asBytes()).hex() == "0000"
+
+			let data = byte[1, 2, 3, 4]
+			let fill = try js.eval("(globalThis.kept = null, (bytes) => \{ kept = bytes; for (let i = 0; i < bytes.length; i++) bytes[i] *= 2; return bytes.length \})")
+			assert try (try fill.call(data)).asInt() == 4
+			assert data.hex() == "02040608"
+			assert try (try js.eval("kept.length")).asInt() == 0
+
+			let lease = try js.lend(data)
+			try (try js.global()).set("shared", lease)
+			try js.eval("shared[0] = 255")
+			assert data[0] == 255
+			lease.detach()
+			assert try (try js.eval("shared.length")).asInt() == 0
+			return none
+		}
+
+		@test()
+		def scripts_hold_adm_objects() !none {
+			let js = new Runtime()
+			let account = Account{owner: "Ada", balance: 1.0, tags: []}
+			let held = try js.value(account)
+			assert held.kind() == Kind.Foreign
+			let echo = try js.eval("x => x")
+			let back = try echo.call(held)
+			assert back.kind() == Kind.Foreign
+			let obj = back.foreign()
+			fail "the object did not come back" when obj is none
+			assert obj is Account
+			assert (try js.eval("1")).foreign() is none
+			assert try (try (try js.eval("(o) => Object.keys(o).length")).call(held)).asInt() == 0
+			return none
+		}
+
+		@test()
+		def builds_objects_and_runs_jobs() !none {
+			let js = new Runtime()
+			let order = try js.object()
+			let lines = try js.array()
+			try lines.set(0, "tea")
+			try lines.set(1, 2)
+			try order.set("lines", lines)
+			try order.set("paid", false)
+			assert try order.json() == "\{\"lines\":[\"tea\",2],\"paid\":false\}"
+
+			try js.eval("var done = 0; Promise.resolve().then(() => \{ done = 1 \})")
+			assert try (try js.eval("done")).asInt() == 0
+			assert try js.runJobs() == 1
+			assert try (try js.eval("done")).asInt() == 1
+			try js.eval("Promise.resolve().then(() => \{ throw new Error('in a job') \})")
+			assert try js.runJobs() == 1
+
+			try lendAccount(js)
+			assert js.engine.objects.len() == 1
+			js.collect()
+			assert js.engine.objects.len() == 0
+			return none
+		}
+
+		@test()
+		def stops_runaway_scripts() !none {
+			let js = new Runtime(timeout = 50ms)
+			let slow = try failureOf(js, "for (;;) \{\}")
+			assert slow.kind == ScriptFailure.TimedOut
+			assert try (try js.eval("1 + 1")).asInt() == 2
+
+			js.timeout(0s)
+			let stopper = async interruptLater(js, 30ms)
+			let stopped = try failureOf(js, "for (;;) \{\}")
+			await stopper
+			assert stopped.kind == ScriptFailure.Interrupted
+			assert try (try js.eval("2 + 2")).asInt() == 4
+
+			let small = new Runtime(memoryLimit = 4000000)
+			let full = try failureOf(small, "let a = []; for (;;) a.push(new Array(1000).fill(1))")
+			assert full.kind == ScriptFailure.OutOfMemory
+			assert small.memory() <= 4000000
+
+			let deep = try failureOf(js, "function f() \{ return f() + 1 \}\nf()")
+			assert deep.message.contains("stack")
+			return none
+		}
+
+		@test()
+		def closes() !none {
+			let js = new Runtime()
+			let kept = try js.eval("(\{ a: 1 \})")
+			let before = js.live()
+			assert before == 1
+			assert js.memory() > 0
+
+			let global = try js.global()
+			try global.set("shut", try js.function("shut", def (_ Value[]) !Value {
+				try js.close()
+				return try js.undefined()
+			}))
+			let refused = try failureOf(js, "shut()")
+			assert refused.message.contains("host function")
+
+			try js.close()
+			try js.close()
+			assert js.live() == 0
+			let after = kept.get("a") onerror (err error) {
+				assert err is ScriptError
+				recover kept
+			}
+			assert after.same(kept) == false
+			let closed = ScriptFailure.Thrown
+			js.eval("1") onerror (err error) {
+				closed = err.kind when err is ScriptError
+				recover kept
+			}
+			assert closed == ScriptFailure.Closed
+			return none
+		}
+
+		@test()
+		def releases_what_it_drops() !none {
+			let js = new Runtime()
+			let square = try js.eval("x => x * x")
+			let base = js.live()
+			for let i = 0; i < 1000; i++ {
+				let out = try square.call(i)
+				assert try out.asInt() == i * i
+			}
+			try js.eval("0")
+			assert js.live() <= base + 2
+
+			let global = try js.global()
+			try global.set("id", try js.function("id", def (args Value[]) !Value {
+				return args[0]
+			}))
+			try js.eval("for (let i = 0; i < 20000; i++) id(i)")
+			try js.eval("0")
+			assert js.live() <= base + 8
+			return none
+		}
+
+		@test()
+		def tasks_share_a_runtime() !none {
+			let js = new Runtime()
+			try js.eval("var hits = 0; function spin(i) \{ hits++; return i \}")
+			let a = async hammer(js, 2000)
+			let b = async hammer(js, 2000)
+			let c = async hammer(js, 2000)
+			let total = (try await a) + (try await b) + (try await c)
+			assert total == 3 * 1999000
+			assert try (try js.eval("hits")).asInt() == 6000
+			return none
+		}
+
+		@test()
+		def host_functions_may_wait() !none {
+			let js = new Runtime()
+			let global = try js.global()
+			try global.set("nap", try js.function("nap", def (_ Value[]) !Value {
+				time.sleep(5ms)
+				return try js.eval("21 * 2")
+			}))
+			assert try (try js.eval("nap() + nap()")).asInt() == 84
+			return none
+		}
+	}
+}

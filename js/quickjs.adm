@@ -1,0 +1,214 @@
+// The C side of adm.interop.js (adm_qjs.c): QuickJS-ng behind functions that
+// take and return integers. `rt` is a runtime handle from aqjsNew; a value is
+// a slot number with its kind in the top byte, 0 when the call threw (the
+// exception waits in aqjsException).
+@link("m")
+internal module adm.interop.js.quickjs {
+	// A new runtime with one context; limits in bytes, 0 for QuickJS's
+	// defaults. `host` runs host functions: (function id, argument count,
+	// first four arguments) to a slot, -1 for undefined, or 0 after aqjsThrow.
+	def aqjsNew(memoryLimit int, stackSize int, @callback host def(int, int, int, int, int, int) int) uint;
+
+	// Frees the JavaScript side; the handle stays valid until aqjsFree. False
+	// when called from inside a host function.
+	def aqjsClose(rt uint) bool;
+
+	// Frees the handle.
+	def aqjsFree(rt uint);
+
+	// Gives a slot back, from any task.
+	def aqjsRelease(rt uint, value int);
+
+	// Slots in use.
+	def aqjsLive(rt uint) int;
+
+	// Stops the running script, or the next one, from any task.
+	def aqjsInterrupt(rt uint);
+
+	// Longest a call may run, in nanoseconds; 0 for no limit.
+	def aqjsTimeout(rt uint, ns int);
+
+	// Why the last script was stopped: 0 not stopped, 1 interrupted, 2 timed
+	// out, 3 out of memory.
+	def aqjsStopReason(rt uint) int;
+
+	// Bytes the runtime holds.
+	def aqjsMemory(rt uint) int;
+
+	// Runs the cycle collector.
+	def aqjsCollect(rt uint);
+
+	// The exception the last failed call put aside; 0 when there is none.
+	def aqjsException(rt uint) int;
+
+	// Throws an Error from the host function in progress; a non-zero foreign
+	// id rides on it.
+	def aqjsThrow(rt uint, message string, foreignId int);
+
+	// Throws a value from the host function in progress.
+	def aqjsThrowValue(rt uint, value int);
+
+	// undefined.
+	def aqjsUndefined(rt uint) int;
+
+	// null.
+	def aqjsNull(rt uint) int;
+
+	// A boolean.
+	def aqjsBool(rt uint, v bool) int;
+
+	// A number.
+	def aqjsNumber(rt uint, v float) int;
+
+	// An integer: a number when exact as one, else a BigInt.
+	def aqjsInteger(rt uint, v int) int;
+
+	// A BigInt.
+	def aqjsBigInt(rt uint, v int) int;
+
+	// A string.
+	def aqjsString(rt uint, text string) int;
+
+	// An empty object.
+	def aqjsObject(rt uint) int;
+
+	// An empty array.
+	def aqjsArray(rt uint) int;
+
+	// The global object.
+	def aqjsGlobal(rt uint) int;
+
+	// A Date from milliseconds since the epoch.
+	def aqjsDate(rt uint, epochMs float) int;
+
+	// A Uint8Array holding a copy of the bytes.
+	@c(params = ["void*", "const uint8_t*", "int64_t"])
+	def aqjsBytes(rt uint, data byte[], n int) int;
+
+	// A Uint8Array over the caller's bytes, no copy; aqjsDetach ends it.
+	@c(params = ["void*", "uint8_t*", "int64_t"])
+	def aqjsView(rt uint, data byte[], n int) int;
+
+	// Detaches the buffer behind a view.
+	def aqjsDetach(rt uint, value int);
+
+	// A function that calls host function `fn`.
+	def aqjsFunction(rt uint, fn int, name string, arity int) int;
+
+	// An opaque object standing for ADM object `id`.
+	def aqjsForeign(rt uint, id int) int;
+
+	// The id behind a foreign object, 0 for anything else.
+	def aqjsForeignId(rt uint, value int) int;
+
+	// Moves up to cap ids of collected foreign objects into out.
+	@c(params = ["void*", "int64_t*", "int64_t"])
+	def aqjsDead(rt uint, out int[], cap int) int;
+
+	// Arguments of the host call in progress from the fifth on.
+	@c(params = ["void*", "int64_t*", "int64_t"])
+	def aqjsArgs(rt uint, out int[], cap int) int;
+
+	// Truthiness.
+	def aqjsToBool(rt uint, value int) bool;
+
+	// The value as a number, NaN when it has none.
+	def aqjsToNumber(rt uint, value int) float;
+
+	// A BigInt's low 64 bits.
+	def aqjsToBigInt(rt uint, value int) int;
+
+	// Whether a BigInt fits 64 bits.
+	def aqjsBigIntFits(rt uint, value int) bool;
+
+	// String(value) as a blob; 0 when it threw.
+	def aqjsText(rt uint, value int) uint;
+
+	// JSON.stringify(value) as a blob; 0 when it threw.
+	def aqjsJson(rt uint, value int) uint;
+
+	// JSON.parse(text).
+	def aqjsParseJson(rt uint, text string) int;
+
+	// Bytes in a blob.
+	def aqjsBlobLen(blob uint) int;
+
+	// Copies a blob out and frees it.
+	@c(params = ["void*", "uint8_t*", "int64_t"])
+	def aqjsBlobTake(blob uint, out byte[], cap int);
+
+	// Byte length of an ArrayBuffer, typed array or DataView; -1 when it threw.
+	def aqjsBytesLen(rt uint, value int) int;
+
+	// Copies up to cap of those bytes into out; the count copied.
+	@c(params = ["void*", "int64_t", "uint8_t*", "int64_t"])
+	def aqjsBytesCopy(rt uint, value int, out byte[], cap int) int;
+
+	// value[name].
+	def aqjsGet(rt uint, value int, name string) int;
+
+	// value[index].
+	def aqjsGetIndex(rt uint, value int, index int) int;
+
+	// value[name] = v; false when it threw.
+	def aqjsSet(rt uint, value int, name string, v int) bool;
+
+	// value[index] = v; false when it threw.
+	def aqjsSetIndex(rt uint, value int, index int, v int) bool;
+
+	// name in value: 1, 0, or -1 when it threw.
+	def aqjsHas(rt uint, value int, name string) int;
+
+	// delete value[name]: 1, 0, or -1 when it threw.
+	def aqjsRemove(rt uint, value int, name string) int;
+
+	// value.length; -1 when it threw.
+	def aqjsLength(rt uint, value int) int;
+
+	// Own enumerable string keys as a blob of (4-byte little-endian length,
+	// bytes) records; 0 when it threw.
+	def aqjsKeys(rt uint, value int) uint;
+
+	// fn.call(receiver, ...args); receiver 0 for undefined.
+	@c(params = ["void*", "int64_t", "int64_t", "const int64_t*", "int64_t"])
+	def aqjsCall(rt uint, fn int, receiver int, args int[], argc int) int;
+
+	// obj[name](...args).
+	@c(params = ["void*", "int64_t", "const char*", "const int64_t*", "int64_t"])
+	def aqjsInvoke(rt uint, obj int, name string, args int[], argc int) int;
+
+	// new fn(...args).
+	@c(params = ["void*", "int64_t", "const int64_t*", "int64_t"])
+	def aqjsConstruct(rt uint, fn int, args int[], argc int) int;
+
+	// Runs a script in the global scope.
+	def aqjsEval(rt uint, code string, name string) int;
+
+	// Makes a module's source available to `import`.
+	def aqjsDefine(rt uint, name string, code string);
+
+	// Evaluates a defined module and returns its namespace.
+	def aqjsImport(rt uint, name string) int;
+
+	// Compiles to bytecode as a blob; 0 when it does not compile.
+	def aqjsCompile(rt uint, code string, name string, isModule bool, strip bool) uint;
+
+	// Runs bytecode from aqjsCompile.
+	@c(params = ["void*", "const uint8_t*", "int64_t"])
+	def aqjsRun(rt uint, code byte[], n int) int;
+
+	// Runs pending promise jobs; the number run, -1 when one threw.
+	def aqjsRunJobs(rt uint) int;
+
+	// 0 pending, 1 fulfilled, 2 rejected, -1 not a promise.
+	def aqjsPromiseState(rt uint, value int) int;
+
+	// A settled promise's value or reason.
+	def aqjsPromiseResult(rt uint, value int) int;
+
+	// Puts a rejected promise's reason aside as the exception.
+	def aqjsPromiseFail(rt uint, value int);
+
+	// a === b.
+	def aqjsSame(rt uint, a int, b int) bool;
+}

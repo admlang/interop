@@ -1,0 +1,604 @@
+partial module adm.interop.js {
+	use (
+		adm.interop.js.quickjs::*
+		std.reflection
+		std.reflection::(FieldKind)
+	)
+
+	// HostFunction is an ADM function a script calls. It gets the call's
+	// arguments and returns the result; an error it fails with is thrown in
+	// the script, and comes back unchanged if the script lets it through.
+	type HostFunction = def(Value[]) !Value
+
+	// Engine is the state a Runtime and its values share: the QuickJS handle
+	// and what ADM keeps on the script's behalf.
+	internal type Engine {
+		// The QuickJS runtime (adm_qjs.c), 0 when it could not be made.
+		handle     uint
+		weak owner ?Runtime
+		// The function C calls for every host function. It holds this engine,
+		// so close() drops it.
+		host       ?def(int, int, int, int, int, int) int
+		functions  HostFunction[]
+		// ADM errors travelling through the script, by foreign id.
+		errors     map<int, error>
+		// ADM objects the script holds, by foreign id.
+		objects    map<int, any>
+		lastId     int
+		// Modules loaded so far, by name.
+		modules    map<string, Value>
+
+		def new(memoryLimit int, stackSize int) {
+			let me = self
+			let entry = def (fn int, argc int, a0 int, a1 int, a2 int, a3 int) int {
+				return me.dispatch(fn, argc, a0, a1, a2, a3)
+			}
+			host = entry
+			handle = aqjsNew(memoryLimit, stackSize, entry)
+		}
+
+		def dispose() {
+			aqjsFree(handle) unless handle == 0
+		}
+
+		// Runs host function fn for the script; see aqjsNew.
+		def dispatch(fn int, argc int, a0 int, a1 int, a2 int, a3 int) int {
+			let rt = owner
+			if rt is none {
+				aqjsThrow(handle, "the runtime was released", 0)
+				return 0
+			}
+			return hostCall(rt, fn, argc, a0, a1, a2, a3)
+		}
+
+		// Adds a host function and returns its id.
+		atomic def register(fn HostFunction) int {
+			functions.push(fn)
+			return functions.len() - 1
+		}
+
+		// The host function with this id.
+		atomic def function(id int) ?HostFunction {
+			return none when id < 0 || id >= functions.len()
+			return functions[id]
+		}
+
+		// Keeps an error while the script carries it and returns its id.
+		atomic def keepError(err error) int {
+			lastId++
+			errors[lastId] = err
+			return lastId
+		}
+
+		// The error kept under id.
+		atomic def keptError(id int) ?error {
+			return errors.get(id)
+		}
+
+		// Keeps an object while the script holds it and returns its id.
+		atomic def keepObject(obj any) int {
+			lastId++
+			objects[lastId] = obj
+			return lastId
+		}
+
+		// The object kept under id.
+		atomic def keptObject(id int) ?any {
+			return objects.get(id)
+		}
+
+		// Forgets what the script no longer holds.
+		atomic def forget(ids int[], n int) {
+			for let i = 0; i < n; i++ {
+				errors.delete(ids[i])
+				objects.delete(ids[i])
+			}
+		}
+
+		// The module loaded under name.
+		atomic def namespace(name string) ?Value {
+			return modules.get(name)
+		}
+
+		// Records a loaded module.
+		atomic def loaded(name string, namespace Value) {
+			modules[name] = namespace
+		}
+
+		// Drops everything held for the script.
+		atomic def clear() {
+			host = none
+			functions = []
+			errors = errors.pickKeys(int[])
+			objects = objects.pickKeys(int[])
+			modules = modules.pickKeys(string[])
+		}
+	}
+
+	// Runtime is one JavaScript engine (QuickJS-ng): its own heap, globals and
+	// modules. Scripts get no access to files, the network or the clock
+	// beyond what the program gives them as host functions.
+	//
+	//     let js = new Runtime()
+	//     let sum = try js.eval("[1, 2, 3].reduce((a, b) => a + b)")
+	//     println(try sum.asInt())
+	//
+	// Any task may use a runtime; calls run one at a time. A value belongs to
+	// the runtime that made it and keeps it alive.
+	type Runtime {
+		// Shared with this runtime's values.
+		engine Engine
+
+		// memoryLimit and stackSize are bytes, 0 for no memory limit and a
+		// 1 MiB stack; a script that needs more memory fails with a
+		// ScriptError of kind OutOfMemory. timeout bounds every call into the script, 0s for none.
+		def new(memoryLimit int = 0, stackSize int = 0, timeout duration = 0s) {
+			engine = new Engine(memoryLimit, stackSize)
+			engine.owner = self
+			aqjsTimeout(engine.handle, int(timeout)) when engine.handle != 0 && timeout > 0s
+		}
+
+		def dispose() {
+			aqjsClose(engine.handle) when engine.handle != 0
+			engine.clear()
+		}
+
+		// Frees the engine and everything the script holds. Values made by
+		// this runtime fail from here on. Fails when called from a host
+		// function, which runs inside the script it would free.
+		def close() !none {
+			return none when engine.handle == 0
+			fail ScriptError{message: "js: close called from a host function", code: "closed", kind: ScriptFailure.Closed} unless aqjsClose(engine.handle)
+			engine.clear()
+			return none
+		}
+
+		// Runs a script in the global scope and returns its completion value.
+		// Fails with a ScriptError when it does not compile or throws.
+		def eval(code string, name string = "<eval>") !Value {
+			return try wrap(self, aqjsEval(engine.handle, code, name))
+		}
+
+		// Makes an ES module's source available to `import` under name,
+		// without running it. A module runs once, when first imported or
+		// loaded.
+		def define(name string, source string) {
+			aqjsDefine(engine.handle, name, source)
+		}
+
+		// Runs the ES module defined under name and returns its namespace, the
+		// object holding its exports. A second load returns the same
+		// namespace. Fails with a ScriptError when the module is not defined,
+		// does not compile, throws, or waits on a promise nothing settles.
+		def load(name string) !Value {
+			let known = engine.namespace(name)
+			if known is none {
+				let namespace = try wrap(self, aqjsImport(engine.handle, name))
+				engine.loaded(name, namespace)
+				return namespace
+			}
+			return known
+		}
+
+		// Defines the module and runs it.
+		// Fails with a ScriptError when the runtime is closed.
+		def load(name string, source string) !Value {
+			define(name, source)
+			return try load(name)
+		}
+
+		// An export of a loaded module. Fails when the module is not loaded.
+		def get(moduleName string, name string) !Value {
+			let namespace = engine.namespace(moduleName)
+			fail ScriptError{message: "js: module \"{moduleName}\" is not loaded", code: "module", kind: ScriptFailure.Thrown} when namespace is none
+			return try namespace.get(name)
+		}
+
+		// Compiles a script, or a module when isModule, to QuickJS bytecode
+		// for run(). strip leaves out source text and line numbers. Fails
+		// with a ScriptError when the source does not compile.
+		def compile(source string, name string = "<eval>", isModule bool = false, strip bool = false) !byte[] {
+			let blob = aqjsCompile(engine.handle, source, name, isModule, strip)
+			try raise(self) when blob == 0
+			return takeBlob(blob)
+		}
+
+		// Runs bytecode from compile(): a script's completion value or a
+		// module's namespace. The bytes must come from compile() of this
+		// library version: QuickJS does not verify bytecode, so anything else
+		// can crash the program. Fails with a ScriptError when the code throws.
+		def run(bytecode byte[]) !Value {
+			return try wrap(self, aqjsRun(engine.handle, bytecode, bytecode.len()))
+		}
+
+		// The global object.
+		// Fails with a ScriptError when the runtime is closed.
+		def global() !Value {
+			return try wrap(self, aqjsGlobal(engine.handle))
+		}
+
+		// JavaScript's undefined.
+		// Fails with a ScriptError when the runtime is closed.
+		def undefined() !Value {
+			return try wrap(self, aqjsUndefined(engine.handle))
+		}
+
+		// JavaScript's null.
+		// Fails with a ScriptError when the runtime is closed.
+		def null() !Value {
+			return try wrap(self, aqjsNull(engine.handle))
+		}
+
+		// A boolean.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v bool) !Value {
+			return try wrap(self, aqjsBool(engine.handle, v))
+		}
+
+		// A number; an integer beyond 2^53 becomes a BigInt, which holds it
+		// exactly.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v int) !Value {
+			return try wrap(self, aqjsInteger(engine.handle, v))
+		}
+
+		// A number.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v float) !Value {
+			return try wrap(self, aqjsNumber(engine.handle, v))
+		}
+
+		// A string.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v string) !Value {
+			return try wrap(self, aqjsString(engine.handle, v))
+		}
+
+		// A Uint8Array holding a copy of the bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def bytes(v byte[]) !Value {
+			return try wrap(self, aqjsBytes(engine.handle, v, v.len()))
+		}
+
+		// Converts an ADM value: a Value stays itself, none is null, numbers,
+		// bools and strings convert, byte[] is copied into a Uint8Array,
+		// other arrays become arrays and string-keyed maps objects (copied,
+		// element by element). Anything else, a struct or a type object,
+		// crosses as a Foreign value the script can hold and pass back but
+		// not look into; copy() makes a plain object of its fields instead.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v any) !Value {
+			return v when v is Value
+			return try bytes(byte[](v)) when reflection.typeName(v) == "byte[]"
+			return try value(v) when v is string
+			return try value(v) when v is int
+			return try value(v) when v is float
+			return try value(v) when v is bool
+			match reflection.kindOf(v) {
+				case FieldKind.Bool:
+					return try value(reflection.scalarText(v) == "true")
+				case FieldKind.Int, FieldKind.Uint, FieldKind.Enum:
+					return try value(reflection.scalarText(v).toInt<int>())
+				case FieldKind.Float:
+					return try value(parseFloat<float>(reflection.scalarText(v)))
+				case FieldKind.String:
+					return try value(reflection.scalarText(v))
+				case FieldKind.Array:
+					let out = try array()
+					for let (i, e) in reflection.elements(v) {
+						try out.set(i, e)
+					}
+					return out
+				case FieldKind.Map:
+					let out = try object()
+					for let key in reflection.keysOf(v) {
+						let e = reflection.entryOf(v, key)
+						if e is none {
+							try out.set(key, try null())
+						} else {
+							try out.set(key, e)
+						}
+					}
+					return out
+				default:
+					return try foreign(v) unless reflection.typeName(v) == "none"
+			}
+			return try null()
+		}
+
+		// A plain object holding a copy of v's fields, by name, each converted
+		// as value() converts it except that nested structs are copied too.
+		// Arrays and maps are copied the same way; anything else converts as
+		// value() does.
+		// Fails with a ScriptError when the runtime is closed.
+		def copy(v any) !Value {
+			let kind = reflection.kindOf(v)
+			if kind == FieldKind.Array {
+				return try bytes(byte[](v)) when reflection.typeName(v) == "byte[]"
+				let out = try array()
+				for let (i, e) in reflection.elements(v) {
+					try out.set(i, try copy(e))
+				}
+				return out
+			}
+			if kind == FieldKind.Map {
+				let out = try object()
+				for let key in reflection.keysOf(v) {
+					let e = reflection.entryOf(v, key)
+					if e is none {
+						try out.set(key, try null())
+					} else {
+						try out.set(key, try copy(e))
+					}
+				}
+				return out
+			}
+			if kind == FieldKind.Struct {
+				let out = try object()
+				for let (_, f) in reflection.fields(v) {
+					try out.set(f.name, try copyField(f))
+				}
+				return out
+			}
+			return try value(v)
+		}
+
+		// One field of a struct, as copy() copies it.
+		internal def copyField(f reflection.Field) !Value {
+			let kind = f.kind
+			if kind == FieldKind.Array {
+				if f.typeName == "byte[]" {
+					let raw byte[]
+					for let i = 0; i < f.len(); i++ {
+						raw.push(byte(f.at(i).asUint()))
+					}
+					return try bytes(raw)
+				}
+				let out = try array()
+				for let i = 0; i < f.len(); i++ {
+					try out.set(i, try copyPart(f.at(i), f.elemKind))
+				}
+				return out
+			}
+			if kind == FieldKind.Map {
+				let out = try object()
+				for let key in f.keys() {
+					try out.set(key, try copyPart(f.entry(key), f.elemKind))
+				}
+				return out
+			}
+			return try copyPart(f, kind)
+		}
+
+		// A scalar or nested object addressed by f: a field, an array element
+		// or a map entry holding this kind.
+		internal def copyPart(f reflection.Field, kind FieldKind) !Value {
+			match kind {
+				case FieldKind.Bool:
+					return try value(f.asBool())
+				case FieldKind.Int, FieldKind.Enum:
+					return try value(f.asInt())
+				case FieldKind.Uint:
+					return try value(int(f.asUint()))
+				case FieldKind.Float:
+					return try value(f.asFloat())
+				case FieldKind.String:
+					return try value(f.asString())
+				default:
+					let inner = f.value()
+					return try null() when inner is none
+					return try copy(inner)
+			}
+			return try null()
+		}
+
+		// An empty object.
+		// Fails with a ScriptError when the runtime is closed.
+		def object() !Value {
+			return try wrap(self, aqjsObject(engine.handle))
+		}
+
+		// An empty array.
+		// Fails with a ScriptError when the runtime is closed.
+		def array() !Value {
+			return try wrap(self, aqjsArray(engine.handle))
+		}
+
+		// A BigInt.
+		// Fails with a ScriptError when the runtime is closed.
+		def bigint(v int) !Value {
+			return try wrap(self, aqjsBigInt(engine.handle, v))
+		}
+
+		// A Date, from milliseconds since the Unix epoch.
+		// Fails with a ScriptError when the runtime is closed.
+		def date(epochMs float) !Value {
+			return try wrap(self, aqjsDate(engine.handle, epochMs))
+		}
+
+		// JSON.parse(text). Fails with a ScriptError when text is not JSON.
+		def parse(text string) !Value {
+			return try wrap(self, aqjsParseJson(engine.handle, text))
+		}
+
+		// A Uint8Array over data itself, with no copy: the script reads and
+		// writes the caller's bytes. The caller keeps data alive and
+		// unresized, and calls detach() on the view when done; from then on
+		// the script sees an empty array.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data byte[]) !Value {
+			return try wrap(self, aqjsView(engine.handle, data, data.len()))
+		}
+
+		// A function the script can call, running fn. name is what the script
+		// sees as its `name`, arity as its `length`.
+		//
+		//     let add = try js.function("add", (args) => js.value(try args[0].asInt() + try args[1].asInt()))
+		//     try (try js.global()).set("add", add)
+		// Fails with a ScriptError when the runtime is closed.
+		def function(name string, fn HostFunction, arity int = 0) !Value {
+			let id = engine.register(fn)
+			return try wrap(self, aqjsFunction(engine.handle, id, name, arity))
+		}
+
+		// An opaque object standing for obj. The script can hold it and pass
+		// it back (Value.foreign() returns obj) but not look into it. obj
+		// stays alive while the script holds the object.
+		// Fails with a ScriptError when the runtime is closed.
+		def foreign(obj any) !Value {
+			reap(self)
+			let id = engine.keepObject(obj)
+			return try wrap(self, aqjsForeign(engine.handle, id))
+		}
+
+		// Runs the promise jobs that are ready and returns how many ran.
+		// Fails with a ScriptError when a job throws.
+		def runJobs() !int {
+			let n = aqjsRunJobs(engine.handle)
+			try raise(self) when n < 0
+			return n
+		}
+
+		// Stops the script that is running, or the next call if none is: it
+		// fails with a ScriptError of kind Interrupted. Callable from any task.
+		def interrupt() {
+			aqjsInterrupt(engine.handle) unless engine.handle == 0
+		}
+
+		// Sets how long a call into the script may run, 0s for no limit. A
+		// call that runs longer fails with a ScriptError of kind TimedOut.
+		def timeout(limit duration) {
+			aqjsTimeout(engine.handle, int(limit)) unless engine.handle == 0
+		}
+
+		// Bytes the engine's heap holds.
+		def memory() int {
+			return engine.handle == 0 ?? (0, aqjsMemory(engine.handle))
+		}
+
+		// Values of this runtime that ADM holds.
+		def live() int {
+			return engine.handle == 0 ?? (0, aqjsLive(engine.handle))
+		}
+
+		// Runs the cycle collector now.
+		def collect() {
+			aqjsCollect(engine.handle) unless engine.handle == 0
+			reap(self)
+		}
+	}
+
+	// Wraps a slot from C; fails with what the script threw when it is 0.
+	internal def wrap(rt Runtime, slot int) !Value {
+		try raise(rt) when slot == 0
+		return new Value(rt, slot)
+	}
+
+	// Fails with the exception the last call put aside: the ADM error a
+	// host function failed with when that is what the script let
+	// through, else a ScriptError.
+	internal def raise(rt Runtime) !none {
+		let handle = rt.engine.handle
+		fail ScriptError{message: "js: the runtime could not be created", code: "closed", kind: ScriptFailure.Closed} when handle == 0
+		let stop = aqjsStopReason(handle)
+		let slot = aqjsException(handle)
+		fail ScriptError{message: "js: the runtime is closed", code: "closed", kind: ScriptFailure.Closed} when slot == 0
+		let thrown = new Value(rt, slot)
+		fail ScriptError{message: "js: the script was interrupted", code: "interrupted", kind: ScriptFailure.Interrupted, value: thrown} when stop == 1
+		fail ScriptError{message: "js: the script ran longer than its timeout", code: "timeout", kind: ScriptFailure.TimedOut, value: thrown} when stop == 2
+		fail ScriptError{message: "js: the script ran out of memory", code: "memory", kind: ScriptFailure.OutOfMemory, value: thrown} when stop == 3
+		fail ScriptError{message: "js: {thrown.str()}", code: "thrown", kind: ScriptFailure.Thrown, value: thrown} when thrown.kind() != Kind.Error
+		let carried = aqjsGet(handle, slot, "admError")
+		if carried != 0 {
+			let id = aqjsForeignId(handle, carried)
+			aqjsRelease(handle, carried)
+			if id != 0 {
+				let original = rt.engine.keptError(id)
+				fail original unless (original is none)
+			}
+		}
+		let name = memberText(thrown, "name")
+		let message = memberText(thrown, "message")
+		let text = name == "" ?? (message, "{name}: {message}")
+		fail ScriptError{message: "js: {text}", code: "thrown", kind: ScriptFailure.Thrown, name: name, trace: memberText(thrown, "stack"), value: thrown}
+	}
+
+	// Runs host function fn for the script; see aqjsNew.
+	internal def hostCall(rt Runtime, fn int, argc int, a0 int, a1 int, a2 int, a3 int) int {
+		let args Value[]
+		args.push(new Value(rt, a0)) when argc > 0
+		args.push(new Value(rt, a1)) when argc > 1
+		args.push(new Value(rt, a2)) when argc > 2
+		args.push(new Value(rt, a3)) when argc > 3
+		if argc > 4 {
+			let rest int[]
+			rest.len(argc - 4)
+			let n = aqjsArgs(rt.engine.handle, rest, argc - 4)
+			for let i = 0; i < n; i++ {
+				args.push(new Value(rt, rest[i]))
+			}
+		}
+		let target = rt.engine.function(fn)
+		if target is none {
+			aqjsThrow(rt.engine.handle, "the host function is gone", 0)
+			return 0
+		}
+		let failure ?error = none
+		let out = callHost(target, args) onerror (err error) {
+			failure = err
+			recover none
+		}
+		if !(failure is none) {
+			throwError(rt, failure)
+			return 0
+		}
+		return -1 when out is none
+		return out.slot
+	}
+
+	// Throws err in the script: the value it carries when it is what a
+	// script threw here, else an Error that keeps err to fail with later.
+	internal def throwError(rt Runtime, err error) {
+		if err is ScriptError {
+			let thrown = err.value
+			if !(thrown is none) {
+				if thrown.runtime.engine.handle == rt.engine.handle {
+					aqjsThrowValue(rt.engine.handle, thrown.slot)
+					return
+				}
+			}
+		}
+		reap(rt)
+		let id = rt.engine.keepError(err)
+		aqjsThrow(rt.engine.handle, err.message, id)
+	}
+
+	// Forgets the errors and objects whose script-side object was
+	// collected.
+	internal def reap(rt Runtime) {
+		return when rt.engine.handle == 0
+		let ids int[]
+		ids.len(64)
+		for {
+			let n = aqjsDead(rt.engine.handle, ids, 64)
+			rt.engine.forget(ids, n)
+			break when n < 64
+		}
+	}
+
+	// Calls a host function; none stands for a result that is undefined.
+	internal def callHost(fn HostFunction, args Value[]) !?Value {
+		let out = try fn(args)
+		return none when out.kind() == Kind.Undefined
+		return out
+	}
+
+	// Copies a blob from C into ADM and frees it.
+	internal def takeBlob(blob uint) byte[] {
+		let n = aqjsBlobLen(blob)
+		let out byte[]
+		out.len(n)
+		aqjsBlobTake(blob, out, n)
+		return out
+	}
+}

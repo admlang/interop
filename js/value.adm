@@ -1,0 +1,394 @@
+partial module adm.interop.js {
+	use (
+		adm.interop.js.quickjs::*
+		std.reflection
+	)
+
+	// Where a promise stands.
+	enum PromiseState {
+		Pending,
+		Fulfilled,
+		Rejected
+	}
+
+	// Value is a JavaScript value held by ADM: a number, a string, an object,
+	// a function. It keeps the value alive in its runtime, and the runtime
+	// alive, until it is released or disposed. Methods fail with a
+	// ScriptError of kind Closed once the runtime is closed.
+	//
+	//     let user = try js.eval("(\{ name: 'Ada', langs: ['adm', 'js'] \})")
+	//     let name = try (try user.get("name")).asString()
+	//     let count = try (try user.get("langs")).len()
+	type Value {
+		// The runtime the value belongs to.
+		runtime Runtime
+		// The value's slot in the runtime, its kind in the top byte; 0 once
+		// released.
+		slot    int
+
+		def new(runtime Runtime, slot int) {
+			self.runtime = runtime
+			self.slot = slot
+		}
+
+		def dispose() {
+			return when slot == 0
+			aqjsRelease(runtime.engine.handle, slot)
+			slot = 0
+		}
+
+		// What the value is.
+		def kind() Kind {
+			return Kind(slot >> 56)
+		}
+
+		// Whether the value is undefined or null.
+		def isNone() bool {
+			return kind() := Kind.Undefined || Kind.Null
+		}
+
+		// Whether the script would take the value as true in a condition.
+		def truthy() bool {
+			return aqjsToBool(runtime.engine.handle, slot)
+		}
+
+		// The boolean. Fails when the value is not one.
+		def asBool() !bool {
+			try expect(Kind.Bool, "a boolean")
+			return aqjsToBool(runtime.engine.handle, slot)
+		}
+
+		// The number. Fails when the value is not a number.
+		def asFloat() !float {
+			try expect(Kind.Number, "a number")
+			return aqjsToNumber(runtime.engine.handle, slot)
+		}
+
+		// The integer: a number with no fraction, or a BigInt. Fails when the
+		// value is neither, has a fraction, or does not fit 64 bits.
+		def asInt() !int {
+			let handle = runtime.engine.handle
+			if kind() == Kind.BigInt {
+				if !aqjsBigIntFits(handle, slot) {
+					discard(handle)
+					fail conversion("the BigInt does not fit 64 bits")
+				}
+				return aqjsToBigInt(handle, slot)
+			}
+			try expect(Kind.Number, "an integer")
+			let n = aqjsToNumber(handle, slot)
+			fail conversion("{n} is not an integer") when n != n || n != n.floor() || n.abs() > 9007199254740992.0
+			return int(n)
+		}
+
+		// The string. Fails when the value is not a string; text() converts
+		// any value.
+		def asString() !string {
+			try expect(Kind.String, "a string")
+			return try text()
+		}
+
+		// The value as the script's String(value) gives it. Fails with a
+		// ScriptError when the conversion throws (a Symbol, a throwing
+		// toString).
+		def text() !string {
+			let blob = aqjsText(runtime.engine.handle, slot)
+			try raise(runtime) when blob == 0
+			return string(takeBlob(blob))
+		}
+
+		// The value as text, "" when it has none; what interpolation prints.
+		def str() string {
+			return slotText(runtime.engine.handle, slot)
+		}
+
+		// A copy of the bytes of an ArrayBuffer, a typed array or a DataView.
+		// Fails when the value is none of these.
+		def asBytes() !byte[] {
+			try expect(Kind.Bytes, "bytes")
+			let handle = runtime.engine.handle
+			let n = aqjsBytesLen(handle, slot)
+			try raise(runtime) when n < 0
+			let out byte[]
+			out.len(n)
+			let copied = aqjsBytesCopy(handle, slot, out, n)
+			try raise(runtime) when copied < 0
+			out.len(copied)
+			return out
+		}
+
+		// JSON.stringify(value). Fails with a ScriptError when the value has
+		// no JSON form (undefined, a function) or a toJSON throws.
+		def json() !string {
+			let blob = aqjsJson(runtime.engine.handle, slot)
+			try raise(runtime) when blob == 0
+			return string(takeBlob(blob))
+		}
+
+		// The ADM object behind a Foreign value; none for any other value.
+		def foreign() ?any {
+			return none unless kind() == Kind.Foreign
+			let id = aqjsForeignId(runtime.engine.handle, slot)
+			return runtime.engine.keptObject(id)
+		}
+
+		// value[name]; undefined when there is no such property. Fails with a
+		// ScriptError when the value is undefined or null, or a getter throws.
+		def get(name string) !Value {
+			return try wrap(runtime, aqjsGet(runtime.engine.handle, slot, name))
+		}
+
+		// value[index].
+		// Fails with a ScriptError when the runtime is closed.
+		def get(index int) !Value {
+			return try wrap(runtime, aqjsGetIndex(runtime.engine.handle, slot, index))
+		}
+
+		// value[name] = v, v converted as Runtime.value converts it. Fails
+		// with a ScriptError when the assignment throws.
+		def set(name string, v any) !none {
+			let converted = try runtime.value(v)
+			try raise(runtime) unless aqjsSet(runtime.engine.handle, slot, name, converted.slot)
+			return none
+		}
+
+		// value[index] = v.
+		// Fails with a ScriptError when the runtime is closed.
+		def set(index int, v any) !none {
+			let converted = try runtime.value(v)
+			try raise(runtime) unless aqjsSetIndex(runtime.engine.handle, slot, index, converted.slot)
+			return none
+		}
+
+		// Whether the value has the property, its prototypes included.
+		// Fails with a ScriptError when the runtime is closed.
+		def has(name string) !bool {
+			let found = aqjsHas(runtime.engine.handle, slot, name)
+			try raise(runtime) when found < 0
+			return found == 1
+		}
+
+		// Deletes the property; false when it cannot be deleted.
+		def remove(name string) !bool {
+			let gone = aqjsRemove(runtime.engine.handle, slot, name)
+			try raise(runtime) when gone < 0
+			return gone == 1
+		}
+
+		// The object's own enumerable property names, as Object.keys gives
+		// them.
+		// Fails with a ScriptError when the runtime is closed.
+		def keys() !string[] {
+			let blob = aqjsKeys(runtime.engine.handle, slot)
+			try raise(runtime) when blob == 0
+			let raw = takeBlob(blob)
+			let out string[]
+			let at = 0
+			for at + 4 <= raw.len() {
+				let n = int(raw[at]) + int(raw[at + 1]) * 256 + int(raw[at + 2]) * 65536 + int(raw[at + 3]) * 16777216
+				out.push(string(raw[at + 4:at + 4 + n]))
+				at += 4 + n
+			}
+			return out
+		}
+
+		// The value's `length`: elements of an array or typed array, UTF-16
+		// units of a string, parameters of a function.
+		// Fails with a ScriptError when the runtime is closed.
+		def len() !int {
+			let n = aqjsLength(runtime.engine.handle, slot)
+			try raise(runtime) when n < 0
+			return n
+		}
+
+		// Calls the function with the arguments, each converted as
+		// Runtime.value converts it, except that a byte[] is lent, not
+		// copied: the script sees a Uint8Array over the caller's bytes that
+		// goes empty when the call returns. Fails with a ScriptError when the
+		// value is not a function or the call throws.
+		def call(args ...any) !Value {
+			let lent Value[]
+			let values = try arguments(args, lent)
+			let slots = slotsOf(values)
+			let out = aqjsCall(runtime.engine.handle, slot, 0, slots, slots.len())
+			takeBack(lent)
+			return try wrap(runtime, out)
+		}
+
+		// Calls the method value[name] with the value as `this`; arguments as
+		// in call().
+		// Fails with a ScriptError when the runtime is closed.
+		def invoke(name string, args ...any) !Value {
+			let lent Value[]
+			let values = try arguments(args, lent)
+			let slots = slotsOf(values)
+			let out = aqjsInvoke(runtime.engine.handle, slot, name, slots, slots.len())
+			takeBack(lent)
+			return try wrap(runtime, out)
+		}
+
+		// new value(...args); arguments as in call().
+		// Fails with a ScriptError when the runtime is closed.
+		def construct(args ...any) !Value {
+			let lent Value[]
+			let values = try arguments(args, lent)
+			let slots = slotsOf(values)
+			let out = aqjsConstruct(runtime.engine.handle, slot, slots, slots.len())
+			takeBack(lent)
+			return try wrap(runtime, out)
+		}
+
+		// Where a promise stands; Fulfilled for a value that is not a promise.
+		def state() PromiseState {
+			match aqjsPromiseState(runtime.engine.handle, slot) {
+				case 0:
+					return PromiseState.Pending
+				case 2:
+					return PromiseState.Rejected
+			}
+			return PromiseState.Fulfilled
+		}
+
+		// Runs the script's promise jobs until this promise settles and
+		// returns what it resolved to; a value that is not a promise is
+		// returned as it is. Fails with a ScriptError carrying the reason
+		// when the promise is rejected, and when it is still pending with no
+		// job left to run: nothing in the script can settle it.
+		def wait() !Value {
+			return self unless kind() == Kind.Promise
+			let handle = runtime.engine.handle
+			for {
+				let state = aqjsPromiseState(handle, slot)
+				return try wrap(runtime, aqjsPromiseResult(handle, slot)) when state == 1
+				if state == 2 {
+					aqjsPromiseFail(handle, slot)
+					try raise(runtime)
+				}
+				try raise(runtime) when state < 0
+				let ran = try runtime.runJobs()
+				fail ScriptError{message: "js: the promise is pending and no job is left to settle it", code: "pending", kind: ScriptFailure.Thrown, value: self} when ran == 0 && aqjsPromiseState(handle, slot) == 0
+			}
+			fail conversion("unreachable")
+		}
+
+		// Whether both are the same value, as `===` compares.
+		def same(other Value) bool {
+			return aqjsSame(runtime.engine.handle, slot, other.slot)
+		}
+
+		// Ends a view made by Runtime.lend: the script sees it empty from
+		// here on, and the bytes behind it may go.
+		def detach() {
+			aqjsDetach(runtime.engine.handle, slot)
+		}
+
+		// Converts call arguments; views made over byte[] arguments are added
+		// to lent.
+		internal def arguments(args any[], lent Value[]) !Value[] {
+			let out Value[]
+			for let (_, a) in args {
+				if reflection.typeName(a) == "byte[]" {
+					let lease = try runtime.lend(byte[](a))
+					lent.push(lease)
+					out.push(lease)
+					continue
+				}
+				out.push(try runtime.value(a))
+			}
+			return out
+		}
+
+		// Fails unless the value is of this kind.
+		internal def expect(want Kind, what string) !none {
+			fail conversion("expected {what}, got {describe(kind())}") unless kind() == want
+			return none
+		}
+	}
+
+	// A property of v as text, "" when it is missing or reading it throws.
+	internal def memberText(v Value, name string) string {
+		let handle = v.runtime.engine.handle
+		let found = aqjsGet(handle, v.slot, name)
+		if found == 0 {
+			discard(handle)
+			return ""
+		}
+		let out = Kind(found >> 56) == Kind.Undefined ?? ("", slotText(handle, found))
+		aqjsRelease(handle, found)
+		return out
+	}
+
+	// A failed conversion.
+	internal def conversion(message string) ScriptError {
+		return ScriptError{message: "js: {message}", code: "conversion", kind: ScriptFailure.Conversion}
+	}
+
+	// How messages name a kind.
+	internal def describe(kind Kind) string {
+		match kind {
+			case Kind.Undefined:
+				return "undefined"
+			case Kind.Null:
+				return "null"
+			case Kind.Bool:
+				return "a boolean"
+			case Kind.Number:
+				return "a number"
+			case Kind.BigInt:
+				return "a BigInt"
+			case Kind.String:
+				return "a string"
+			case Kind.Symbol:
+				return "a symbol"
+			case Kind.Object:
+				return "an object"
+			case Kind.Array:
+				return "an array"
+			case Kind.Function:
+				return "a function"
+			case Kind.Error:
+				return "an error"
+			case Kind.Promise:
+				return "a promise"
+			case Kind.Bytes:
+				return "bytes"
+			case Kind.Date:
+				return "a date"
+			case Kind.Foreign:
+				return "an ADM object"
+		}
+		return "an object"
+	}
+
+	// The slots of values, for a call into C.
+	internal def slotsOf(values Value[]) int[] {
+		let out int[]
+		for let (_, v) in values {
+			out.push(v.slot)
+		}
+		return out
+	}
+
+	// Detaches the views lent to a call.
+	internal def takeBack(lent Value[]) {
+		for let (_, v) in lent {
+			v.detach()
+		}
+	}
+
+	// String(value) for a slot, "" when the conversion throws.
+	internal def slotText(handle uint, slot int) string {
+		let blob = aqjsText(handle, slot)
+		if blob == 0 {
+			discard(handle)
+			return ""
+		}
+		return string(takeBlob(blob))
+	}
+
+	// Drops the exception a failed call put aside.
+	internal def discard(handle uint) {
+		let thrown = aqjsException(handle)
+		aqjsRelease(handle, thrown) unless thrown == 0
+	}
+}

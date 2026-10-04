@@ -1,0 +1,12 @@
+// QuickJS-ng as an ADM library: JavaScript inside an ADM program.
+@manifest(version = "0.1.0")
+library adm.interop.js {
+	use (
+		adm.interop.js
+		adm.interop.js.quickjs
+	)
+
+	export (
+		adm.interop.js
+	)
+}
