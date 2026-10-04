@@ -12,14 +12,8 @@ In your project directory:
 adm get admlang:adm.interop.js
 ```
 
-This downloads the library from the ADM registry, verifies its signature and records it in
-`adm.lock`. To keep the dependency in the project's manifest as well, add it to `adm.toml`; a plain
-`adm get` then fetches whatever the lock does not cover yet:
-
-```toml
-[deps]
-"admlang:adm.interop.js" = "^0.1"
-```
+This downloads the library from the ADM registry, verifies its signature, and records it in
+`adm.lock` and under `[deps]` in the project's `adm.toml`. 
 
 The library contains C code (the engine). ADM normally asks before installing a package that
 brings foreign code; official `admlang` packages are accepted without the question.

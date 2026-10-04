@@ -6,5 +6,4 @@ sha256  a0955463c74809173a253ff87365095e6972e8b171cfb6aa8a1e781adf35cfeb  quickj
 sha256  7c853a67ce7b6db463018e44f1425cd019d9f004a012ca013f47e415eb43446c  quickjs-amalgam.c
 sha256  747a77444ff04a910b57ca51dd998d7ee46895b1b9592d7d6051fd180317c44d  quickjs.h
 
-Unmodified. Update with tools/vendor-quickjs.sh <version> <sha256 of the zip>;
-adm_qjs.c in this folder is ours.
+Both files are unmodified. adm_qjs.c in this folder is not part of QuickJS-ng.

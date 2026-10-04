@@ -82,11 +82,9 @@ internal module adm.interop.js.quickjs {
 	def aqjsDate(rt uint, epochMs float) int;
 
 	// A Uint8Array holding a copy of the bytes.
-	@c(params = ["void*", "const uint8_t*", "int64_t"])
 	def aqjsBytes(rt uint, data byte[], n int) int;
 
 	// A Uint8Array over the caller's bytes, no copy; aqjsDetach ends it.
-	@c(params = ["void*", "uint8_t*", "int64_t"])
 	def aqjsView(rt uint, data byte[], n int) int;
 
 	// Detaches the buffer behind a view.
@@ -102,11 +100,9 @@ internal module adm.interop.js.quickjs {
 	def aqjsForeignId(rt uint, value int) int;
 
 	// Moves up to cap ids of collected foreign objects into out.
-	@c(params = ["void*", "int64_t*", "int64_t"])
 	def aqjsDead(rt uint, out int[], cap int) int;
 
 	// Arguments of the host call in progress from the fifth on.
-	@c(params = ["void*", "int64_t*", "int64_t"])
 	def aqjsArgs(rt uint, out int[], cap int) int;
 
 	// Truthiness.
@@ -134,14 +130,12 @@ internal module adm.interop.js.quickjs {
 	def aqjsBlobLen(blob uint) int;
 
 	// Copies a blob out and frees it.
-	@c(params = ["void*", "uint8_t*", "int64_t"])
 	def aqjsBlobTake(blob uint, out byte[], cap int);
 
 	// Byte length of an ArrayBuffer, typed array or DataView; -1 when it threw.
 	def aqjsBytesLen(rt uint, value int) int;
 
 	// Copies up to cap of those bytes into out; the count copied.
-	@c(params = ["void*", "int64_t", "uint8_t*", "int64_t"])
 	def aqjsBytesCopy(rt uint, value int, out byte[], cap int) int;
 
 	// value[name].
@@ -170,15 +164,12 @@ internal module adm.interop.js.quickjs {
 	def aqjsKeys(rt uint, value int) uint;
 
 	// fn.call(receiver, ...args); receiver 0 for undefined.
-	@c(params = ["void*", "int64_t", "int64_t", "const int64_t*", "int64_t"])
 	def aqjsCall(rt uint, fn int, receiver int, args int[], argc int) int;
 
 	// obj[name](...args).
-	@c(params = ["void*", "int64_t", "const char*", "const int64_t*", "int64_t"])
 	def aqjsInvoke(rt uint, obj int, name string, args int[], argc int) int;
 
 	// new fn(...args).
-	@c(params = ["void*", "int64_t", "const int64_t*", "int64_t"])
 	def aqjsConstruct(rt uint, fn int, args int[], argc int) int;
 
 	// Runs a script in the global scope.
@@ -194,7 +185,6 @@ internal module adm.interop.js.quickjs {
 	def aqjsCompile(rt uint, code string, name string, isModule bool, strip bool) uint;
 
 	// Runs bytecode from aqjsCompile.
-	@c(params = ["void*", "const uint8_t*", "int64_t"])
 	def aqjsRun(rt uint, code byte[], n int) int;
 
 	// Runs pending promise jobs; the number run, -1 when one threw.
