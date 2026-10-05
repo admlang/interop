@@ -1,0 +1,398 @@
+partial module adm.interop.lua {
+	use (
+		std.errors
+		std.testing
+		std.time
+	)
+
+	// An ADM error with a payload, to check it survives a trip through a script.
+	internal struct QuotaError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		used    int
+	}
+
+	internal struct Account {
+		owner   string
+		balance float
+		labels  string[]
+	}
+
+	// The failure of a chunk that must fail, as a ScriptError.
+	internal def failureOf(lua Runtime, code string) !ScriptError {
+		let found ?ScriptError = none
+		lua.eval(code) onerror (err error) {
+			found = err when err is ScriptError
+			recover try lua.nil()
+		}
+		fail "the script did not fail: {code}" when found is none
+		return found
+	}
+
+	// Calls the script function `spin` a number of times from its own task.
+	internal async def hammer(lua Runtime, rounds int) !int {
+		let spin = try lua.eval("return spin")
+		let total = 0
+		for let i = 0; i < rounds; i++ {
+			total += try (try spin.call(i)).asInt()
+		}
+		return total
+	}
+
+	// Interrupts the runtime after a pause.
+	internal async def interruptLater(lua Runtime, pause duration) {
+		time.sleep(pause)
+		lua.interrupt()
+	}
+
+	// Hands the script an ADM object and drops the handle to it.
+	internal def lendAccount(lua Runtime) !none {
+		let held = try lua.foreign(Account{owner: "Bob", balance: 2.0, labels: []})
+		assert held.kind() == Kind.Foreign
+		return none
+	}
+
+	check "Runtime" {
+		@test()
+		def evaluates_scalars() !none {
+			let lua = new Runtime()
+			assert try (try lua.eval("return 1 + 2")).asInt() == 3
+			assert (try lua.eval("return 1 + 2")).kind() == Kind.Integer
+			assert (try lua.eval("return 1 / 2")).kind() == Kind.Float
+			assert try (try lua.eval("return 1 / 2")).asFloat() == 0.5
+			assert try (try lua.eval("return 6 / 2")).asInt() == 3
+			assert try (try lua.eval("return 'hé' .. 'llo'")).asString() == "héllo"
+			assert try (try lua.eval("return 1 < 2")).asBool()
+			assert (try lua.eval("local x = 1")).isNone()
+			assert (try lua.eval("return nil")).kind() == Kind.Nil
+			assert (try lua.eval("return 0")).truthy()
+			assert !(try lua.eval("return false")).truthy()
+			assert "{try lua.eval("return 42")}" == "42"
+			assert try (try lua.eval("return math.maxinteger")).asInt() == 9223372036854775807
+			assert try (try lua.eval("return _VERSION")).asString() == "Lua 5.4"
+			return none
+		}
+
+		@test()
+		def refuses_wrong_conversions() !none {
+			let lua = new Runtime()
+			let text = try lua.eval("return 'x'")
+			let n = text.asInt() onerror recover -1
+			assert n == -1
+			let half = (try lua.eval("return 1.5")).asInt() onerror recover -1
+			assert half == -1
+			let flag = (try lua.eval("return 1")).asBool() onerror recover false
+			assert !flag
+			let s = (try lua.eval("return 1")).asString() onerror recover "no"
+			assert s == "no"
+			return none
+		}
+
+		@test()
+		def converts_adm_values() !none {
+			let lua = new Runtime()
+			let show = try lua.eval("return function(t) local parts = \{\} for i, v in ipairs(t) do parts[#parts + 1] = tostring(v) end return table.concat(parts, ',') end")
+			assert try (try lua.value(42)).asInt() == 42
+			assert try (try lua.value(2.5)).asFloat() == 2.5
+			assert try (try lua.value("héllo")).asString() == "héllo"
+			assert try (try lua.value(true)).asBool()
+			let numbers int[] = [1, 2, 3]
+			assert (try lua.value(numbers)).kind() == Kind.Table
+			assert try (try show.call(numbers)).asString() == "1,2,3"
+			let table map<string, string>
+			table["a"] = "x"
+			table["b"] = "y"
+			let converted = try lua.value(table)
+			assert try (try converted.get("b")).asString() == "y"
+			let account = Account{owner: "Ada", balance: 12.5, labels: ["a", "b"]}
+			let copied = try lua.copy(account)
+			assert try (try copied.get("owner")).asString() == "Ada"
+			assert try (try copied.get("balance")).asFloat() == 12.5
+			assert try (try show.call(try copied.get("labels"))).asString() == "a,b"
+			assert (try lua.value(none)).isNone()
+			return none
+		}
+
+		@test()
+		def reads_and_writes_tables() !none {
+			let lua = new Runtime()
+			let user = try lua.eval("return \{ name = 'Ada', langs = \{ 'adm', 'lua' \}, [10] = 'ten' \}")
+			assert user.kind() == Kind.Table
+			assert try (try user.get("name")).asString() == "Ada"
+			let langs = try user.get("langs")
+			assert try langs.len() == 2
+			assert try (try langs.get(1)).asString() == "adm"
+			assert (try langs.get(3)).isNone()
+			try user.set("age", 36)
+			try langs.set(3, "c")
+			assert try langs.len() == 3
+			assert try user.has("age")
+			assert !(try user.has("missing"))
+			let keys = try user.keys()
+			assert keys.len() == 3 && keys.indexOf("age") >= 0 && keys.indexOf("langs") >= 0 && keys.indexOf("name") >= 0
+			try user.remove("age")
+			assert !(try user.has("age"))
+			let global = try lua.global()
+			try global.set("answer", 42)
+			assert try (try lua.eval("return answer + 1")).asInt() == 43
+			let broken = (try lua.eval("return 5")).get("x") onerror recover try lua.nil()
+			assert broken.isNone()
+			return none
+		}
+
+		@test()
+		def calls_functions() !none {
+			let lua = new Runtime()
+			let add = try lua.eval("return function(a, b) return a + b end")
+			assert add.kind() == Kind.Function
+			assert try (try add.call(2, 3)).asInt() == 5
+			assert try (try add.call(1.5, 2)).asFloat() == 3.5
+			let divmod = try lua.eval("return function(a, b) return a // b, a % b end")
+			let both = try divmod.callAll(17, 5)
+			assert both.len() == 2
+			assert try both[0].asInt() == 3 && try both[1].asInt() == 2
+			assert (try (try lua.eval("return function() end")).callAll()).len() == 0
+			let counter = try lua.eval("return \{ n = 0, add = function(self, by) self.n = self.n + by return self.n end \}")
+			assert try (try counter.invoke("add", 5)).asInt() == 5
+			assert try (try counter.invoke("add", 2)).asInt() == 7
+			let many = try lua.eval("return function(...) return select('#', ...) end")
+			assert try (try many.call(1, 2, 3, 4, 5, 6, 7)).asInt() == 7
+			let notCallable = (try lua.eval("return 5")).call() onerror recover try lua.value(-1)
+			assert try notCallable.asInt() == -1
+			return none
+		}
+
+		@test()
+		def reports_script_errors() !none {
+			let lua = new Runtime()
+			let thrown = try failureOf(lua, "local function inner() error('boom') end inner()")
+			assert thrown.kind == ScriptFailure.Thrown
+			assert thrown.message == "lua: eval:1: boom"
+			assert thrown.trace.contains("stack traceback")
+			let syntax = try failureOf(lua, "return +")
+			assert syntax.message.contains("unexpected symbol")
+			let value = try failureOf(lua, "error(\{ code = 7 \})")
+			let payload = value.value
+			fail "no error value" when payload is none
+			assert try (try payload.get("code")).asInt() == 7
+			let named = lua.eval("error('late')", "billing.lua") onerror (err error) {
+				assert err.message == "lua: billing.lua:1: late"
+				recover try lua.nil()
+			}
+			assert named.isNone()
+			return none
+		}
+
+		@test()
+		def scripts_call_host_functions() !none {
+			let lua = new Runtime()
+			let global = try lua.global()
+			try global.set("add", try lua.function(def (args Value[]) !Value {
+				return try lua.value(try args[0].asInt() + try args[1].asInt())
+			}))
+			assert try (try lua.eval("return add(2, 3) * 2")).asInt() == 10
+			try global.set("count", try lua.function(def (args Value[]) !Value {
+				return try lua.value(args.len())
+			}))
+			assert try (try lua.eval("return count(1, 2, 3, 4, 5, 6, 7)")).asInt() == 7
+			assert try (try lua.eval("return count()")).asInt() == 0
+			try global.set("nothing", try lua.function(def (_ Value[]) !Value {
+				return try lua.nil()
+			}))
+			assert try (try lua.eval("return select('#', nothing())")).asInt() == 0
+			try global.set("twice", try lua.function(def (args Value[]) !Value {
+				return try args[0].call(try args[0].call(1))
+			}))
+			assert try (try lua.eval("return twice(function(n) return n + 10 end)")).asInt() == 21
+			return none
+		}
+
+		@test()
+		def host_errors_cross_the_script() !none {
+			let lua = new Runtime()
+			let global = try lua.global()
+			try global.set("spend", try lua.function(def (_ Value[]) !Value {
+				fail QuotaError{message: "over quota", code: "quota", used: 9}
+			}))
+			let used = 0
+			lua.eval("spend()") onerror (err error) {
+				used = err.used when err is QuotaError
+				recover try lua.nil()
+			}
+			assert used == 9
+			assert try (try lua.eval("local ok, err = pcall(spend) return tostring(err)")).asString() == "over quota"
+			assert !(try (try lua.eval("return (pcall(spend))")).asBool())
+			try global.set("rethrow", try lua.function(def (args Value[]) !Value {
+				return try args[0].call()
+			}))
+			let message = ""
+			lua.eval("rethrow(function() error('inner', 0) end)") onerror (err error) {
+				message = err.message
+				recover try lua.nil()
+			}
+			assert message == "lua: inner"
+			return none
+		}
+
+		@test()
+		def loads_modules() !none {
+			let lua = new Runtime()
+			lua.define("shapes", "local M = \{\} function M.area(w, h) return w * h end M.loads = (M.loads or 0) + 1 return M")
+			let app = try lua.load("app", "local shapes = require('shapes') return \{ room = shapes.area(3, 4), same = require('shapes') == shapes \}")
+			assert try (try app.get("room")).asInt() == 12
+			assert try (try app.get("same")).asBool()
+			assert try (try lua.get("shapes", "loads")).asInt() == 1
+			assert (try lua.load("app")).same(app)
+			let missing = lua.load("nope") onerror (err error) {
+				assert err.message.contains("module 'nope' is not defined")
+				recover try lua.nil()
+			}
+			assert missing.isNone()
+			assert try (try lua.load("quiet", "local x = 1")).asBool()
+			return none
+		}
+
+		@test()
+		def scripts_get_no_files() !none {
+			let lua = new Runtime()
+			assert try (try lua.eval("return io == nil and os == nil and package == nil and debug == nil and dofile == nil and loadfile == nil")).asBool()
+			assert try (try lua.eval("return load('return 7')()")).asInt() == 7
+			let code = try lua.compile("return 7")
+			let global = try lua.global()
+			try global.set("blob", try lua.bytes(code))
+			assert try (try lua.eval("return load(blob) == nil and load(blob, 'x', 'b') == nil")).asBool()
+			return none
+		}
+
+		@test()
+		def compiles_to_bytecode() !none {
+			let lua = new Runtime()
+			let script = try lua.compile("local t = 0 for i = 1, 3 do t = t + i end return t")
+			assert script.len() > 0
+			let other = new Runtime()
+			assert try (try other.run(script)).asInt() == 6
+			let stripped = try lua.compile("return 'hi'", "unit.lua", strip = true)
+			assert try (try other.run(stripped)).asString() == "hi"
+			let broken = lua.compile("return +") onerror recover byte[]
+			assert broken.len() == 0
+			return none
+		}
+
+		@test()
+		def moves_bytes() !none {
+			let lua = new Runtime()
+			let raw = try lua.bytes(byte[0, 255, 65])
+			assert raw.kind() == Kind.String
+			assert (try raw.asBytes()).hex() == "00FF41"
+			assert try raw.len() == 3
+			assert (try (try lua.eval("return string.char(1, 0, 2)")).asBytes()).hex() == "010002"
+			let size = try lua.eval("return function(s) return #s end")
+			assert try (try size.call(byte[1, 2, 3, 4])).asInt() == 4
+			return none
+		}
+
+		@test()
+		def scripts_hold_adm_objects() !none {
+			let lua = new Runtime()
+			let account = Account{owner: "Ada", balance: 1.0, labels: []}
+			let held = try lua.foreign(account)
+			assert held.kind() == Kind.Foreign
+			let echo = try lua.eval("return function(x) return x end")
+			let back = try echo.call(held)
+			let found = back.foreign()
+			fail "the object did not come back" when found is none
+			assert found is Account && found.owner == "Ada"
+			assert try (try (try lua.eval("return function(x) return type(x) end")).call(account)).asString() == "userdata"
+			assert try (try (try lua.eval("return function(x) return getmetatable(x) end")).call(held)).asBool() == false
+			assert (try lua.eval("return 1")).foreign() is none
+			return none
+		}
+
+		@test()
+		def stops_runaway_scripts() !none {
+			let lua = new Runtime(timeout = 30ms)
+			let late = try failureOf(lua, "while true do end")
+			assert late.kind == ScriptFailure.TimedOut
+			let caught = try failureOf(lua, "while true do pcall(function() while true do end end) end")
+			assert caught.kind == ScriptFailure.TimedOut
+			assert try (try lua.eval("return 1")).asInt() == 1
+
+			lua.timeout(0s)
+			let stopper = async interruptLater(lua, 20ms)
+			let stopped = try failureOf(lua, "while true do end")
+			await stopper
+			assert stopped.kind == ScriptFailure.Interrupted
+			assert try (try lua.eval("return 2")).asInt() == 2
+
+			let small = new Runtime(memoryLimit = 2000000)
+			let full = try failureOf(small, "local t = \{\} for i = 1, 1e9 do t[i] = tostring(i) end")
+			assert full.kind == ScriptFailure.OutOfMemory
+			assert try (try small.eval("return 3")).asInt() == 3
+			return none
+		}
+
+		@test()
+		def closes() !none {
+			let lua = new Runtime()
+			let kept = try lua.eval("return \{ n = 1 \}")
+			let global = try lua.global()
+			try global.set("shut", try lua.function(def (_ Value[]) !Value {
+				try lua.close()
+				return try lua.nil()
+			}))
+			let inside = try failureOf(lua, "shut()")
+			assert inside.kind == ScriptFailure.Closed
+			try lua.close()
+			try lua.close()
+			let after = lua.eval("return 1") onerror (err error) {
+				assert err is ScriptError && err.kind == ScriptFailure.Closed
+				recover kept
+			}
+			assert after.same(kept)
+			let gone = kept.get("n") onerror recover kept
+			assert gone.same(kept)
+			assert lua.memory() == 0
+			return none
+		}
+
+		@test()
+		def releases_what_it_drops() !none {
+			let lua = new Runtime()
+			let before = lua.live()
+			for let i = 0; i < 1000; i++ {
+				let v = try lua.value(i)
+				assert try v.asInt() == i
+			}
+			assert lua.live() == before
+			try lendAccount(lua)
+			lua.collect()
+			lua.collect()
+			assert lua.engine.objects.len() == 0
+			return none
+		}
+
+		@test()
+		def tasks_share_a_runtime() !none {
+			let lua = new Runtime()
+			try lua.eval("hits = 0 function spin(i) hits = hits + 1 return i end")
+			let a = async hammer(lua, 2000)
+			let b = async hammer(lua, 2000)
+			let c = async hammer(lua, 2000)
+			let total = (try await a) + (try await b) + (try await c)
+			assert total == 3 * 1999000
+			assert try (try lua.eval("return hits")).asInt() == 6000
+			return none
+		}
+
+		@test()
+		def runs_coroutines() !none {
+			let lua = new Runtime()
+			let total = try lua.eval("local co = coroutine.wrap(function() for i = 1, 3 do coroutine.yield(i) end end) return co() + co() + co()")
+			assert try total.asInt() == 6
+			assert (try lua.eval("return coroutine.create(function() end)")).kind() == Kind.Thread
+			return none
+		}
+	}
+}

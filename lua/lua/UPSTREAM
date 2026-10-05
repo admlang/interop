@@ -1,0 +1,26 @@
+Lua 5.4.8 (PUC-Rio), from the release tarball.
+https://www.lua.org/ftp/lua-5.4.8.tar.gz
+License: MIT (LICENSE in this folder, from lua.h).
+
+sha256  4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae  lua-5.4.8.tar.gz
+sha256  50d24c301a4e7f5cdee7573dc31589c2bf9457782b7f0a0df22c0485977b218e  lua-amalgam.c
+sha256  3b77329f9deed929a5cbe7a7d5fc81ebbb63fd869a49e0a9302fe9240caf1930  lua.h
+sha256  af243c94bee6d2601383e8b65ed66a0d1b4ab3b7418ff903fcd0679912160e3a  luaconf.h
+sha256  4ea0f67d3e467f5d6a327616e22a3c2da8e03d47a3c3660916275f2842f521ea  lualib.h
+sha256  2d9e18e577a6062646268e7f7228264c28bd9b972c186e1af81b8357179c0ab4  lauxlib.h
+
+lua.h, luaconf.h, lualib.h and lauxlib.h are the release's files, unmodified.
+
+lua-amalgam.c is generated from the release's src/ and holds its sources unmodified, in the
+order upstream's onelua.c includes them: lzio lctype lopcodes lmem lundump ldump lstate lgc llex
+lcode lparser ldebug lfunc lobject ltm lstring ltable ldo lvm lapi lauxlib lbaselib lcorolib
+lmathlib lstrlib ltablib lutf8lib. Each internal header (lprefix.h, llimits.h, lobject.h, ...)
+is inlined where first included; the four public headers stay #includes. Before the sources it
+defines LUA_CORE, LUA_LIB, ltable_c and lvm_c, includes luaconf.h and makes the internal symbols
+static (LUAI_FUNC, LUAI_DDEF, LUAI_DDEC), as onelua.c does, and after the C library's headers it sets
+hidden visibility, so the Lua API stays inside the program. liolib, loslib, loadlib, ldblib, linit, lua.c and
+luac.c are left out: scripts get no files, clock, process or dynamic libraries.
+
+To regenerate: python3 amalgam.py <lua-5.4.8>/src lua-amalgam.c
+
+adm_lua.c and amalgam.py in this folder are not part of Lua.

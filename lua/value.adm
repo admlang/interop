@@ -1,0 +1,281 @@
+partial module adm.interop.lua {
+	use (
+		adm.interop.lua.engine::*
+	)
+
+	// Value is a Lua value held by ADM: a number, a string, a table, a
+	// function. It keeps the value alive in its runtime, and the runtime
+	// alive, until it is released or disposed. Methods fail with a
+	// ScriptError of kind Closed once the runtime is closed.
+	//
+	//     let user = try lua.eval("return \{ name = 'Ada', langs = \{ 'adm', 'lua' \} \}")
+	//     let name = try (try user.get("name")).asString()
+	//     let count = try (try user.get("langs")).len()
+	type Value {
+		// The runtime the value belongs to.
+		runtime Runtime
+		// The value's slot in the runtime, its kind in the top byte; 0 once
+		// released.
+		slot    int
+
+		def new(runtime Runtime, slot int) {
+			self.runtime = runtime
+			self.slot = slot
+		}
+
+		def dispose() {
+			return when slot == 0
+			aluaRelease(runtime.engine.handle, slot)
+			slot = 0
+		}
+
+		// What the value is.
+		def kind() Kind {
+			return Kind(slot >> 56)
+		}
+
+		// Whether the value is nil.
+		def isNone() bool {
+			return kind() == Kind.Nil
+		}
+
+		// Whether the script would take the value as true in a condition:
+		// everything but nil and false.
+		def truthy() bool {
+			return aluaToBool(runtime.engine.handle, slot)
+		}
+
+		// The boolean. Fails when the value is not one.
+		def asBool() !bool {
+			try expect(Kind.Bool, "a boolean")
+			return aluaToBool(runtime.engine.handle, slot)
+		}
+
+		// The number as a float. Fails when the value is not a number.
+		def asFloat() !float {
+			fail conversion("expected a number, got {describe(kind())}") unless kind() := Kind.Integer || Kind.Float
+			return aluaToNumber(runtime.engine.handle, slot)
+		}
+
+		// The integer: an integer, or a float with no fraction. Fails when
+		// the value is neither or does not fit 64 bits.
+		def asInt() !int {
+			let handle = runtime.engine.handle
+			return aluaToInteger(handle, slot) when kind() == Kind.Integer
+			try expect(Kind.Float, "an integer")
+			let n = aluaToNumber(handle, slot)
+			fail conversion("{n} is not an integer") when n != n || n != n.floor() || n.abs() >= 9223372036854775808.0
+			return int(n)
+		}
+
+		// The string. Fails when the value is not a string; text() converts
+		// any value. Bytes that are not UTF-8 are replaced; asBytes() keeps
+		// them.
+		def asString() !string {
+			return string(try asBytes())
+		}
+
+		// The bytes of a string. Fails when the value is not a string.
+		def asBytes() !byte[] {
+			try expect(Kind.String, "a string")
+			let blob = aluaBytes(runtime.engine.handle, slot)
+			try raise(runtime) when blob == 0
+			return takeBlob(blob)
+		}
+
+		// The value as the script's tostring(value) gives it. Fails with a
+		// ScriptError when a __tostring metamethod raises.
+		def text() !string {
+			let blob = aluaText(runtime.engine.handle, slot)
+			try raise(runtime) when blob == 0
+			return string(takeBlob(blob))
+		}
+
+		// The value as text, "" when it has none; what interpolation prints.
+		def str() string {
+			return slotText(runtime.engine.handle, slot)
+		}
+
+		// The ADM object behind a Foreign value; none for any other value.
+		def foreign() ?any {
+			return none unless kind() == Kind.Foreign
+			let id = aluaForeignId(runtime.engine.handle, slot)
+			return runtime.engine.keptObject(id)
+		}
+
+		// value[name]; nil when there is no such field. Fails with a
+		// ScriptError when the value cannot be indexed or __index raises.
+		def get(name string) !Value {
+			return try wrap(runtime, aluaGet(runtime.engine.handle, slot, name))
+		}
+
+		// value[index]; Lua counts from 1.
+		// Fails with a ScriptError as get(name) does.
+		def get(index int) !Value {
+			return try wrap(runtime, aluaGetIndex(runtime.engine.handle, slot, index))
+		}
+
+		// value[name] = v, v converted as Runtime.value converts it. Fails
+		// with a ScriptError when the assignment raises.
+		def set(name string, v any) !none {
+			let converted = try runtime.value(v)
+			try raise(runtime) unless aluaSet(runtime.engine.handle, slot, name, converted.slot)
+			return none
+		}
+
+		// value[index] = v; Lua counts from 1.
+		// Fails with a ScriptError as set(name, v) does.
+		def set(index int, v any) !none {
+			let converted = try runtime.value(v)
+			try raise(runtime) unless aluaSetIndex(runtime.engine.handle, slot, index, converted.slot)
+			return none
+		}
+
+		// Whether value[name] is not nil.
+		// Fails with a ScriptError as get(name) does.
+		def has(name string) !bool {
+			return !(try get(name)).isNone()
+		}
+
+		// Sets value[name] to nil, which removes the field.
+		// Fails with a ScriptError as set(name, v) does.
+		def remove(name string) !none {
+			let nothing = try runtime.nil()
+			try raise(runtime) unless aluaSet(runtime.engine.handle, slot, name, nothing.slot)
+			return none
+		}
+
+		// A table's string keys, in the order Lua walks them.
+		// Fails with a ScriptError when the value is not a table.
+		def keys() !string[] {
+			let blob = aluaKeys(runtime.engine.handle, slot)
+			try raise(runtime) when blob == 0
+			let raw = takeBlob(blob)
+			let out string[]
+			let at = 0
+			for at + 4 <= raw.len() {
+				let n = int(raw[at]) + int(raw[at + 1]) * 256 + int(raw[at + 2]) * 65536 + int(raw[at + 3]) * 16777216
+				out.push(string(raw[at + 4:at + 4 + n]))
+				at += 4 + n
+			}
+			return out
+		}
+
+		// The value's length, as `#value` gives it: the border of a table,
+		// the bytes of a string.
+		// Fails with a ScriptError when the value has no length.
+		def len() !int {
+			let n = aluaLength(runtime.engine.handle, slot)
+			try raise(runtime) when n < 0
+			return n
+		}
+
+		// Calls the function with the arguments, each converted as
+		// Runtime.value converts it, and returns its first result, nil when
+		// it returns nothing. Fails with a ScriptError when the value cannot
+		// be called or the call raises an error.
+		def call(args ...any) !Value {
+			let values = try arguments(args)
+			let slots = slotsOf(values)
+			return try wrap(runtime, aluaCall(runtime.engine.handle, slot, slots, slots.len()))
+		}
+
+		// The same, returning every result of the function.
+		// Fails with a ScriptError as call() does.
+		def callAll(args ...any) !Value[] {
+			let values = try arguments(args)
+			let slots = slotsOf(values)
+			let found int[]
+			found.len(8)
+			let n = aluaCallAll(runtime.engine.handle, slot, slots, slots.len(), found, 8)
+			try raise(runtime) when n < 0
+			let out Value[]
+			for let i = 0; i < n && i < 8; i++ {
+				out.push(new Value(runtime, found[i]))
+			}
+			fail conversion("the function returned {n} values, more than the 8 callAll takes") when n > 8
+			return out
+		}
+
+		// Calls the method value:name(...): value[name] with the value as
+		// its first argument; arguments and result as in call().
+		// Fails with a ScriptError as call() does.
+		def invoke(name string, args ...any) !Value {
+			let values = try arguments(args)
+			let slots = slotsOf(values)
+			return try wrap(runtime, aluaInvoke(runtime.engine.handle, slot, name, slots, slots.len()))
+		}
+
+		// Whether both are the same value, as rawequal compares.
+		def same(other Value) bool {
+			return slot == other.slot || aluaSame(runtime.engine.handle, slot, other.slot)
+		}
+
+		// Converts call arguments.
+		internal def arguments(args any[]) !Value[] {
+			let out Value[]
+			for let (_, a) in args {
+				out.push(try runtime.value(a))
+			}
+			return out
+		}
+
+		// Fails unless the value is of this kind.
+		internal def expect(want Kind, what string) !none {
+			fail conversion("expected {what}, got {describe(kind())}") unless kind() == want
+			return none
+		}
+	}
+
+	// A failed conversion.
+	internal def conversion(message string) ScriptError {
+		return ScriptError{message: "lua: {message}", code: "conversion", kind: ScriptFailure.Conversion}
+	}
+
+	// How messages name a kind.
+	internal def describe(kind Kind) string {
+		match kind {
+			case Kind.Nil:
+				return "nil"
+			case Kind.Bool:
+				return "a boolean"
+			case Kind.Integer:
+				return "an integer"
+			case Kind.Float:
+				return "a float"
+			case Kind.String:
+				return "a string"
+			case Kind.Table:
+				return "a table"
+			case Kind.Function:
+				return "a function"
+			case Kind.Userdata:
+				return "a userdata"
+			case Kind.Thread:
+				return "a coroutine"
+			case Kind.Foreign:
+				return "an ADM object"
+		}
+		return "a value"
+	}
+
+	// The slots of values, for a call into C.
+	internal def slotsOf(values Value[]) int[] {
+		let out int[]
+		for let (_, v) in values {
+			out.push(v.slot)
+		}
+		return out
+	}
+
+	// tostring(value) for a slot, "" when the conversion raises.
+	internal def slotText(handle uint, slot int) string {
+		let blob = aluaText(handle, slot)
+		if blob == 0 {
+			let thrown = aluaException(handle)
+			aluaRelease(handle, thrown) unless thrown == 0
+			return ""
+		}
+		return string(takeBlob(blob))
+	}
+}

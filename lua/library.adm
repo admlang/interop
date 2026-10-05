@@ -1,0 +1,12 @@
+// Lua 5.4 as an ADM library: Lua inside an ADM program.
+@manifest(version = "0.1.0")
+library adm.interop.lua {
+	use (
+		adm.interop.lua
+		adm.interop.lua.engine
+	)
+
+	export (
+		adm.interop.lua
+	)
+}

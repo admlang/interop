@@ -1,0 +1,168 @@
+// The C side of adm.interop.lua (adm_lua.c): Lua 5.4 behind functions that
+// take and return integers. `rt` is a runtime handle from aluaNew; a value is
+// a slot number with its kind in the top byte, 0 when the call raised (the
+// error waits in aluaException).
+@link("m")
+internal module adm.interop.lua.engine {
+	// A new runtime; memoryLimit in bytes, 0 for none. `host` runs host
+	// functions: (function id, argument count, first four arguments) to a
+	// slot, -1 for no result, or 0 after aluaThrow.
+	def aluaNew(memoryLimit int, @callback host def(int, int, int, int, int, int) int) uint;
+
+	// Frees the Lua side; the handle stays valid until aluaFree. False when
+	// called from inside a host function.
+	def aluaClose(rt uint) bool;
+
+	// Frees the handle.
+	def aluaFree(rt uint);
+
+	// Gives a slot back, from any task.
+	def aluaRelease(rt uint, value int);
+
+	// Slots in use.
+	def aluaLive(rt uint) int;
+
+	// Stops the running script, or the next one, from any task.
+	def aluaInterrupt(rt uint);
+
+	// Longest a call may run, in nanoseconds; 0 for no limit.
+	def aluaTimeout(rt uint, ns int);
+
+	// Why the last failed call was stopped: 0 not stopped, 1 interrupted,
+	// 2 timed out, 3 out of memory.
+	def aluaStopReason(rt uint) int;
+
+	// Bytes the runtime holds.
+	def aluaMemory(rt uint) int;
+
+	// Runs a full collection.
+	def aluaCollect(rt uint);
+
+	// The error the last failed call put aside; 0 when there is none.
+	def aluaException(rt uint) int;
+
+	// The traceback of the last error a script raised, in a blob.
+	def aluaTrace(rt uint) uint;
+
+	// Sets the error the host function in progress raises when it returns
+	// 0; a non-zero foreign id rides on it.
+	def aluaThrow(rt uint, message string, foreignId int);
+
+	// The same with a value.
+	def aluaThrowValue(rt uint, value int);
+
+	// nil.
+	def aluaNil(rt uint) int;
+
+	// A boolean.
+	def aluaBool(rt uint, v bool) int;
+
+	// A float.
+	def aluaNumber(rt uint, v float) int;
+
+	// An integer.
+	def aluaInteger(rt uint, v int) int;
+
+	// A string.
+	def aluaString(rt uint, text string) int;
+
+	// A string holding these bytes.
+	def aluaStringOf(rt uint, data byte[], n int) int;
+
+	// An empty table.
+	def aluaTable(rt uint) int;
+
+	// The table of globals.
+	def aluaGlobals(rt uint) int;
+
+	// A function that calls host function `fn`.
+	def aluaFunction(rt uint, fn int) int;
+
+	// An opaque object standing for the ADM object kept under `id`.
+	def aluaForeign(rt uint, id int) int;
+
+	// The id behind a foreign object; 0 for any other value.
+	def aluaForeignId(rt uint, value int) int;
+
+	// Moves up to cap ids of collected foreign objects into out.
+	def aluaDead(rt uint, out int[], cap int) int;
+
+	// The arguments beyond the fourth of the host call in progress.
+	def aluaArgs(rt uint, out int[], cap int) int;
+
+	// Lua's truth: everything but nil and false.
+	def aluaToBool(rt uint, value int) bool;
+
+	// A number as a float; 0 for anything else.
+	def aluaToNumber(rt uint, value int) float;
+
+	// An integer; 0 for anything else, a float included.
+	def aluaToInteger(rt uint, value int) int;
+
+	// The value as tostring() gives it, in a blob; 0 when that raised.
+	def aluaText(rt uint, value int) uint;
+
+	// The bytes of a string, in a blob; empty for any other value.
+	def aluaBytes(rt uint, value int) uint;
+
+	// Bytes in a blob.
+	def aluaBlobLen(blob uint) int;
+
+	// Copies a blob into out and frees it.
+	def aluaBlobTake(blob uint, out byte[], cap int);
+
+	// value[name]; 0 when indexing raised.
+	def aluaGet(rt uint, value int, name string) int;
+
+	// value[index].
+	def aluaGetIndex(rt uint, value int, index int) int;
+
+	// value[name] = v. False when the assignment raised.
+	def aluaSet(rt uint, value int, name string, v int) bool;
+
+	// value[index] = v.
+	def aluaSetIndex(rt uint, value int, index int, v int) bool;
+
+	// #value; -1 when taking the length raised.
+	def aluaLength(rt uint, value int) int;
+
+	// A table's string keys in a blob, each a 4-byte little-endian length
+	// and its bytes; 0 when the value is not a table.
+	def aluaKeys(rt uint, value int) uint;
+
+	// Copies t[1..#t] into out as floats, up to cap, and returns how many;
+	// -1 when reading raised or an element is not a number.
+	def aluaNumbers(rt uint, value int, out float[], cap int) int;
+
+	// The same for integers: integers, or floats with no fraction.
+	def aluaIntegers(rt uint, value int, out int[], cap int) int;
+
+	// Whether both are the same value, as rawequal compares.
+	def aluaSame(rt uint, a int, b int) bool;
+
+	// Calls fn and returns its first result, nil when it returns nothing; 0
+	// when it raised.
+	def aluaCall(rt uint, fn int, args int[], argc int) int;
+
+	// The same with up to cap results in out; returns how many the function
+	// returned, -1 when it raised.
+	def aluaCallAll(rt uint, fn int, args int[], argc int, out int[], cap int) int;
+
+	// obj:name(args...), first result.
+	def aluaInvoke(rt uint, obj int, name string, args int[], argc int) int;
+
+	// Runs source text as a chunk and returns its first result.
+	def aluaEval(rt uint, code string, name string) int;
+
+	// Makes a module's source available to require, without running it.
+	def aluaDefine(rt uint, name string, code string);
+
+	// The value of the module defined under name, run on first use.
+	def aluaRequire(rt uint, name string) int;
+
+	// Compiles source text to bytecode in a blob; 0 when it does not compile.
+	def aluaCompile(rt uint, code string, name string, strip bool) uint;
+
+	// Runs bytecode from aluaCompile and returns its first result.
+	def aluaRun(rt uint, code byte[], n int) int;
+}

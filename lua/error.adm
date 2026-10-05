@@ -1,0 +1,50 @@
+partial module adm.interop.lua {
+	use std.errors
+
+	// What a Lua value is.
+	enum Kind {
+		Nil,
+		Bool,
+		Integer,
+		Float,
+		String,
+		Table,
+		Function,
+		Userdata,
+		// A coroutine.
+		Thread,
+		// An ADM object the script holds without seeing inside it.
+		Foreign
+	}
+
+	// Why a script failed.
+	enum ScriptFailure {
+		// The script raised an error.
+		Thrown,
+		// Runtime.interrupt stopped it.
+		Interrupted,
+		// It ran longer than the runtime's timeout.
+		TimedOut,
+		// It needed more memory than the runtime's limit.
+		OutOfMemory,
+		// The runtime is closed.
+		Closed,
+		// A value was not what the caller asked for.
+		Conversion
+	}
+
+	// ScriptError is the failure of a script or of a conversion. A handler
+	// that narrows with `err is ScriptError` reads `kind`, the Lua traceback
+	// (`trace`) and the error value itself.
+	struct ScriptError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ScriptFailure
+		// The Lua traceback, one frame per line; "" when there is none.
+		trace   string
+		// What the script raised; none for failures that are not errors.
+		value   ?Value
+	}
+}
