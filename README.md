@@ -7,9 +7,9 @@ the `admlang` publisher.
 | Library | Language | Engine | Status |
 |---------|---|---|---|
 | [`adm.interop.js`](js/) | JavaScript | QuickJS-ng 0.17.0 | Run scripts and ES modules, exchange values, call in both directions |
+| [`adm.interop.lua`](lua/) | Lua | Lua 5.4.8 | Run scripts and modules, exchange values, call in both directions |
 |-|Python|-|In progress|
 |-|Java|-|In progress|
-|-|Lua|-|In progress|
 |-|WebAssembly|-|In progress|
 
 ## Install
@@ -24,4 +24,4 @@ Each library's README covers its use.
 
 ## License
 
-The engines keep their own licenses, recorded beside their sources (`js/quickjs/LICENSE`).
+The engines keep their own licenses, recorded beside their sources (`js/quickjs/LICENSE`, `lua/lua/LICENSE`).
