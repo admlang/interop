@@ -34,3 +34,7 @@ to = "lua/lauxlib.h"
 [[package.files]]
 from = "lua/LICENSE"
 to = "lua/LICENSE"
+
+[publisher]
+pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
+repo_salt = "base64:kzXP/4DB5Qw4MNyifeFgm2CBEtmWKWlvUaommpNiNFU="
