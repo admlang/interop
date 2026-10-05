@@ -1,0 +1,106 @@
+partial module adm.interop.wasm {
+	use std.testing
+
+	// (module
+	//   (import "env" "twice" (func $twice (param i32) (result i32)))
+	//   (func (export "add_twice") (param i32 i32) (result i32)
+	//     (i32.add (call $twice (local.get 0)) (call $twice (local.get 1))))
+	//   (func (export "divide") (param i32 i32) (result i32)
+	//     (i32.div_s (local.get 0) (local.get 1)))
+	//   (func (export "spin") (loop (br 0))))
+	internal const apiBinary = byte[0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 0x0f, 3, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 0, 2, 0x0d, 1, 3, 0x65, 0x6e, 0x76, 5, 0x74, 0x77, 0x69, 0x63, 0x65, 0, 0, 3, 4, 3, 1, 1, 2, 7, 0x1d, 3, 9, 0x61, 0x64, 0x64, 0x5f, 0x74, 0x77, 0x69, 0x63, 0x65, 0, 1, 6, 0x64, 0x69, 0x76, 0x69, 0x64, 0x65, 0, 2, 4, 0x73, 0x70, 0x69, 0x6e, 0, 3, 0x0a, 0x1d, 3, 0x0b, 0, 0x20, 0, 0x10, 0, 0x20, 1, 0x10, 0, 0x6a, 0x0b, 7, 0, 0x20, 0, 0x20, 1, 0x6d, 0x0b, 7, 0, 3, 0x40, 0x0c, 0, 0x0b, 0x0b]
+
+	internal def apiNumber(n int) Value {
+		return Value{kind: ValueType.I32, bits: n}
+	}
+
+	// A store that provides env.twice, and the module instantiated in it.
+	internal def apiInstance(store Store) !Instance {
+		let twice = store.function(ValueType[ValueType.I32], ValueType[ValueType.I32], def (args Value[]) !Value[] {
+			return Value[apiNumber(args[0].bits * 2)]
+		})
+		store.provide("env", "twice", twice)
+		return try store.instantiate(try decode(apiBinary))
+	}
+
+	internal def apiStart(store Store, m Module) !none {
+		try store.instantiate(m)
+		return none
+	}
+
+	check "Wasm" {
+		@test()
+		def lists_imports_and_exports() !none {
+			let m = try decode(apiBinary)
+			try m.validate()
+			assert m.imports.len() == 1 && m.imports[0].moduleName == "env" && m.imports[0].name == "twice" && m.imports[0].kind == ExternKind.Function
+			assert m.exports.len() == 3 && m.exports[0].name == "add_twice" && m.exports[2].name == "spin"
+			return none
+		}
+
+		@test()
+		def calls_exports_and_host_functions() !none {
+			let instance = try apiInstance(new Store())
+			let results = try instance.invoke("add_twice", Value[apiNumber(3), apiNumber(4)])
+			assert results.len() == 1 && results[0].kind == ValueType.I32 && results[0].bits == 14
+			return none
+		}
+
+		@test()
+		def reports_traps_and_bad_calls() !none {
+			let instance = try apiInstance(new Store())
+			let blank Value[]
+			let code = ""
+			let message = ""
+			instance.invoke("divide", Value[apiNumber(1), apiNumber(0)]) onerror (err error) {
+				message = err.message
+				code = err.code when err is Trap
+				recover blank
+			}
+			assert code == "trap" && message == "wasm trap: integer divide by zero"
+			message = ""
+			instance.invoke("missing", blank) onerror (err error) {
+				message = err.message
+				recover blank
+			}
+			assert message == "wasm: no export named \"missing\""
+			message = ""
+			instance.invoke("divide", Value[apiNumber(1)]) onerror (err error) {
+				message = err.message
+				recover blank
+			}
+			assert message == "wasm: the function takes 2 arguments, not 1"
+			return none
+		}
+
+		@test()
+		def refuses_a_module_whose_import_is_missing() !none {
+			let store = new Store()
+			let code = ""
+			let m = try decode(apiBinary)
+			let failed = false
+			apiStart(store, m) onerror (err error) {
+				code = err.code when err is ModuleError
+				failed = true
+				recover none
+			}
+			assert failed && code == "unlinkable"
+			return none
+		}
+
+		@test()
+		def stops_a_loop_when_the_fuel_runs_out() !none {
+			let store = new Store()
+			store.fuel(1000)
+			let instance = try apiInstance(store)
+			let blank Value[]
+			let code = ""
+			instance.invoke("spin", blank) onerror (err error) {
+				code = err.code when err is Trap
+				recover blank
+			}
+			assert code == "exhausted" && store.fuel() < 0
+			return none
+		}
+	}
+}

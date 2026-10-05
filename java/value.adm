@@ -1,0 +1,282 @@
+partial module adm.interop.java {
+	use (
+		adm.interop.java.engine::*
+	)
+
+	// Value is a Java value held by ADM: a number, a boolean or a string as
+	// it is, or an object, an array or a class that stays alive in the VM
+	// until the value is released or disposed.
+	//
+	//     let builder = try (try java.load("java.lang.StringBuilder")).construct("a")
+	//     try builder.invoke("append", 42)
+	//     println(try builder.text())
+	type Value {
+		// The runtime the value belongs to.
+		runtime Runtime
+		// What the value is; kind() reads it.
+		what    Kind
+		// The object's handle in the VM; 0 for a number, a boolean, a
+		// string, null, and once released.
+		handle  int
+		// A boolean or an integer, or the id of a Function or of the ADM
+		// object behind a Foreign value.
+		bits    int
+		// A float.
+		number  float
+		// A string.
+		chars   string
+
+		def new(runtime Runtime, what Kind) {
+			self.runtime = runtime
+			self.what = what
+		}
+
+		def dispose() {
+			if handle != 0 {
+				machine.release(handle)
+				handle = 0
+			}
+			if what == Kind.Function && bits != 0 {
+				machine.drop(bits)
+				bits = 0
+			}
+		}
+
+		// What the value is.
+		def kind() Kind {
+			return what
+		}
+
+		// Whether the value is null.
+		def isNone() bool {
+			return what == Kind.Null
+		}
+
+		// The boolean. Fails when the value is not one.
+		def asBool() !bool {
+			try expect(Kind.Bool, "a boolean")
+			return bits != 0
+		}
+
+		// The number as a float. Fails when the value is not a number.
+		def asFloat() !float {
+			return float(bits) when what == Kind.Integer
+			try expect(Kind.Float, "a number")
+			return number
+		}
+
+		// The integer: an integer, or a float with no fraction. Fails when
+		// the value is neither or does not fit 64 bits.
+		def asInt() !int {
+			return bits when what == Kind.Integer
+			try expect(Kind.Float, "an integer")
+			let n = number
+			fail conversion("{n} is not an integer") when n != n || n != n.floor() || n.abs() >= 9223372036854775808.0
+			return int(n)
+		}
+
+		// The string. Fails when the value is not a String or a char;
+		// text() converts any value.
+		def asString() !string {
+			try expect(Kind.String, "a string")
+			return chars
+		}
+
+		// The bytes of a Java byte[], copied, or of a string as UTF-8.
+		// Fails when the value is neither.
+		def asBytes() !byte[] {
+			return chars.bytes() when what == Kind.String
+			try expect(Kind.Array, "a byte[]")
+			let out byte[]
+			out.push(byte(opElements))
+			try writeValue(out, self)
+			let r = try ask(out)
+			r.u8()
+			fail conversion("expected a byte[], got an array of another type") unless r.u8() == 66
+			let n = r.u32()
+			return r.rest()[:n].clone()
+		}
+
+		// The value as Java's String.valueOf gives it. Fails with a
+		// ScriptError when its toString() throws.
+		def text() !string {
+			return chars when what == Kind.String
+			let out byte[]
+			out.push(byte(opText))
+			try writeValue(out, self)
+			return readValue(try ask(out)).chars
+		}
+
+		// The value as text, "" when it has none; what interpolation prints.
+		def str() string {
+			return text() onerror recover ""
+		}
+
+		// The ADM object behind a Foreign value; none for any other value.
+		def foreign() ?any {
+			return none unless what == Kind.Foreign
+			return machine.keptObject(bits)
+		}
+
+		// The public field `name` of an object, or the static field of a
+		// class value; `length` of an array.
+		// Fails with a ScriptError of kind Binding when there is no such
+		// field.
+		def get(name string) !Value {
+			let out byte[]
+			out.push(byte(opGet))
+			try writeValue(out, self)
+			putString(out, name)
+			return readValue(try ask(out))
+		}
+
+		// The element at index of an array or a java.util.List, from 0.
+		// Fails with a ScriptError when the value is neither or the index
+		// is outside it.
+		def get(index int) !Value {
+			let out byte[]
+			out.push(byte(opGetIndex))
+			try writeValue(out, self)
+			put64(out, index)
+			return readValue(try ask(out))
+		}
+
+		// Sets the field `name`, v converted as Runtime.value converts it
+		// and then to the field's type.
+		// Fails with a ScriptError of kind Binding when there is no such
+		// field, and of kind Conversion when it cannot take v.
+		def set(name string, v any) !none {
+			let out byte[]
+			out.push(byte(opSet))
+			try writeValue(out, self)
+			putString(out, name)
+			let keep Value[]
+			try encode(out, v, keep)
+			try ask(out)
+			return none
+		}
+
+		// Sets the element at index of an array or a java.util.List.
+		// Fails with a ScriptError as get(index) does, and when the
+		// element cannot take v.
+		def set(index int, v any) !none {
+			let out byte[]
+			out.push(byte(opSetIndex))
+			try writeValue(out, self)
+			put64(out, index)
+			let keep Value[]
+			try encode(out, v, keep)
+			try ask(out)
+			return none
+		}
+
+		// The length of an array or a string (in UTF-16 units, as Java
+		// counts), the size of a collection or a map.
+		// Fails with a ScriptError when the value has no length.
+		def len() !int {
+			let out byte[]
+			out.push(byte(opLength))
+			try writeValue(out, self)
+			return readValue(try ask(out)).bits
+		}
+
+		// Calls the method `name` of an object, or the static method of a
+		// class value, with the arguments, each converted as Runtime.value
+		// converts it. Of the methods with that name, Java's rules pick the
+		// one whose parameters take the arguments without losing anything:
+		// an integer goes where a long, an int it fits, or a double is
+		// taken, a string where a String or a char is. Returns the result,
+		// null for a void method.
+		// Fails with a ScriptError of kind Binding when no method takes the
+		// arguments, and of kind Thrown when the method throws.
+		def invoke(name string, args ...any) !Value {
+			let out byte[]
+			out.push(byte(opInvoke))
+			try writeValue(out, self)
+			putString(out, name)
+			put32(out, args.len())
+			let keep Value[]
+			for let (_, a) in args {
+				try encode(out, a, keep)
+			}
+			return readValue(try ask(out))
+		}
+
+		// Makes an instance of a class value with the constructor that
+		// takes the arguments, chosen as invoke() chooses a method. On an
+		// array class ("int[]") the one argument is the length of the new
+		// array.
+		// Fails with a ScriptError when the value is not a class, when no
+		// constructor takes the arguments, and when the constructor throws.
+		def construct(args ...any) !Value {
+			let out byte[]
+			out.push(byte(opConstruct))
+			try writeValue(out, self)
+			put32(out, args.len())
+			let keep Value[]
+			for let (_, a) in args {
+				try encode(out, a, keep)
+			}
+			return readValue(try ask(out))
+		}
+
+		// Whether both are the same object, as Java's == compares; numbers,
+		// booleans and strings compare by value.
+		def same(other Value) bool {
+			return what == other.what && bits == other.bits && number == other.number && chars == other.chars when handle == 0 || other.handle == 0
+			return handle == other.handle || (compare(opSame, other) onerror recover false)
+		}
+
+		// Whether Java's equals() holds between the two.
+		// Fails with a ScriptError when equals() throws.
+		def equals(other Value) !bool {
+			return try compare(opEquals, other)
+		}
+
+		internal def compare(op int, other Value) !bool {
+			let out byte[]
+			out.push(byte(op))
+			try writeValue(out, self)
+			try writeValue(out, other)
+			return readValue(try ask(out)).bits != 0
+		}
+
+		// Fails unless the value is of this kind.
+		internal def expect(want Kind, wanted string) !none {
+			fail conversion("expected {wanted}, got {describe(what)}") unless what == want
+			return none
+		}
+	}
+
+	// A failed conversion.
+	internal def conversion(message string) ScriptError {
+		return ScriptError{message: "java: {message}", code: "conversion", kind: ScriptFailure.Conversion}
+	}
+
+	// How messages name a kind.
+	internal def describe(kind Kind) string {
+		match kind {
+			case Kind.Null:
+				return "null"
+			case Kind.Bool:
+				return "a boolean"
+			case Kind.Integer:
+				return "an integer"
+			case Kind.Float:
+				return "a float"
+			case Kind.String:
+				return "a string"
+			case Kind.Array:
+				return "an array"
+			case Kind.Object:
+				return "an object"
+			case Kind.Class:
+				return "a class"
+			case Kind.Function:
+				return "an ADM function"
+			case Kind.Foreign:
+				return "an ADM object"
+		}
+		return "a value"
+	}
+}

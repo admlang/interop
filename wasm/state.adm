@@ -1,0 +1,517 @@
+internal partial module adm.interop.wasm.engine {
+	use (
+		adm.interop.wasm::*
+		std.mem
+	)
+
+	def trap(message string) Trap {
+		return Trap{message: "wasm trap: {message}", code: "trap"}
+	}
+
+	def exhausted(message string) Trap {
+		return Trap{message: "wasm trap: {message}", code: "exhausted"}
+	}
+
+	// A module whose imports the store cannot satisfy.
+	def unlinkable(message string) ModuleError {
+		return ModuleError{message: "wasm: {message}", code: "unlinkable", offset: -1}
+	}
+
+	// Memory is a linear memory: bytes, in pages of 64 KiB.
+	type Memory {
+		bytes   byte[]
+		bounded bool
+		// In pages; meaningful when bounded.
+		max     int
+
+		def new(limits Limits) {
+			bytes.len(limits.min << 16)
+			bounded = limits.bounded
+			max = limits.max
+		}
+	}
+
+	// Table is a table of references: 0 for null, else the number the
+	// store gave the function or the host value.
+	type Table {
+		elements int[]
+		element  ValueType
+		bounded  bool
+		max      int
+
+		def new(kind TableType) {
+			elements.len(kind.limits.min)
+			element = kind.element
+			bounded = kind.limits.bounded
+			max = kind.limits.max
+		}
+	}
+
+	// The key of a name in the store's maps: its bytes in hex, since a name
+	// may contain U+0000.
+	def nameKey(name string) string {
+		return name.bytes().hex()
+	}
+
+	// Linked is an instantiated module: what it exports.
+	type Linked {
+		store   Machine
+		// By nameKey of the export's name.
+		exports map<string, Extern>
+
+		def new(store Machine) {
+			self.store = store
+		}
+
+		// Calls the exported function `name`.
+		// Fails with a Trap when the code traps, and with an error when no
+		// function is exported under that name or the arguments do not
+		// match its parameters.
+		def invoke(name string, args Value[]) !Value[] {
+			let key = nameKey(name)
+			fail "wasm: no export named \"{name}\"" unless exports.hasKey(key)
+			let e = exports[key]
+			fail "wasm: export \"{name}\" is not a function" unless e.kind == ExternKind.Function
+			return try store.call(e.id, args)
+		}
+	}
+
+	// Machine owns everything instances share: the compiled code, the value
+	// stack, and the functions, tables, memories and globals, which modules
+	// pass to each other through imports and exports. One task uses a store
+	// at a time.
+	type Machine {
+		// The compiled code of every function, and the constants their
+		// frames start with.
+		code        int[]
+		pool        int[]
+		// The frames' slots, and three words per call in progress.
+		stack       int[]
+		calls       int[]
+		// How much of calls is in use.
+		callTop     int
+		globals     int[]
+		memories    Memory[]
+		tables      Table[]
+		// Per function: where its code starts (-1 for a host function), its
+		// type, and its index in hosts.
+		entries     int[]
+		signatures  int[]
+		hostOf      int[]
+		hosts       HostFunction[]
+		// The function types of all modules, each once.
+		typeKeys    map<string, int>
+		typeParams  int[][]
+		typeResults int[][]
+		// The data segments (a range of a module's binary) and the element
+		// segments; a dropped one is empty.
+		dataBytes   byte[][]
+		dataFrom    int[]
+		dataTo      int[]
+		elems       int[][]
+		// What modules can import, by nameKey of the module name, ":" and
+		// nameKey of the name.
+		provided    map<string, Extern>
+		// The first stack slot free for a call from outside.
+		floor       int
+		// Fuel left when metered: a function entry and a loop iteration
+		// each take one.
+		metered     bool
+		fuel        int
+		// Limits: slots of the value stack, calls in progress.
+		maxStack    int
+		maxCalls    int
+		// The most elements table.grow lets a table reach.
+		maxTable    int
+		// Scratch for the vector instructions: the lanes of the operands,
+		// of the result and of a shuffle's picks.
+		lanesA      int[]
+		lanesB      int[]
+		lanesR      int[]
+		lanesP      int[]
+		valueLow    int
+		valueHigh   int
+		nothing     int[]
+
+		def new() {
+			maxStack = 1 << 21
+			maxCalls = 3 << 17
+			maxTable = 1 << 24
+			stack.len(4096)
+			lanesA.len(16)
+			lanesB.len(16)
+			lanesR.len(16)
+			lanesP.len(16)
+		}
+
+		// The number of the function type with these parameters and results.
+		internal def signature(params int[], results int[]) int {
+			let key = "{params.join(",")}>{results.join(",")}"
+			return typeKeys[key] when typeKeys.hasKey(key)
+			typeKeys[key] = typeParams.len()
+			typeParams.push(params)
+			typeResults.push(results)
+			return typeParams.len() - 1
+		}
+
+		// Makes `e` importable as `name` of the module `moduleName`.
+		def provide(moduleName string, name string, e Extern) {
+			provided["{nameKey(moduleName)}:{nameKey(name)}"] = e
+		}
+
+		// Makes every export of `instance` importable from the module
+		// `moduleName`.
+		def register(moduleName string, instance Linked) {
+			for let (key, e) in instance.exports {
+				provided["{nameKey(moduleName)}:{key}"] = e
+			}
+		}
+
+		// A host function of the given type.
+		def function(params ValueType[], results ValueType[], fn HostFunction) Extern {
+			let p int[]
+			for let (_, t) in params {
+				p.push(t.value)
+			}
+			let r int[]
+			for let (_, t) in results {
+				r.push(t.value)
+			}
+			entries.push(-1)
+			signatures.push(signature(p, r))
+			hostOf.push(hosts.len())
+			hosts.push(fn)
+			return Extern{kind: ExternKind.Function, id: entries.len() - 1}
+		}
+
+		// A global holding `value`.
+		def global(value Value, mutable bool) Extern {
+			globals.push(slotBits(value.kind.value, value.bits))
+			globals.push(value.high) when value.kind == ValueType.V128
+			let slot = globals.len() - (value.kind == ValueType.V128 ?? (2, 1))
+			return Extern{kind: ExternKind.Global, id: slot, content: value.kind, mutable: mutable}
+		}
+
+		// The value of the global `e`.
+		def read(e Extern) Value {
+			let v = Value{kind: e.content, bits: globals[e.id]}
+			v.high = globals[e.id + 1] when v.kind == ValueType.V128
+			return v
+		}
+
+		// A table of this type, its elements null.
+		def table(kind TableType) Extern {
+			tables.push(new Table(kind))
+			return Extern{kind: ExternKind.Table, id: tables.len() - 1}
+		}
+
+		// A memory of these limits, its bytes zero.
+		def memory(limits Limits) Extern {
+			memories.push(new Memory(limits))
+			return Extern{kind: ExternKind.Memory, id: memories.len() - 1}
+		}
+
+		// Instantiates a module: validates it, binds its imports to what
+		// the store provides, compiles its functions, fills its tables and
+		// memories from the active segments and runs its start function.
+		// Fails with a ModuleError when the module is invalid ("invalid")
+		// or an import is missing or of another type ("unlinkable"), and
+		// with a Trap when a segment does not fit or the start function
+		// traps; what the module wrote before the trap stays written.
+		def instantiate(m Binary) !Linked {
+			let c = new Compiler(m)
+			try c.verify()
+			let problem = ""
+			for let (_, entry) in m.imports {
+				let label = "{entry.moduleName}.{entry.name}"
+				let key = "{m.bytes[entry.moduleBytes.from:entry.moduleBytes.to].hex()}:{m.bytes[entry.bytes.from:entry.bytes.to].hex()}"
+				if !provided.hasKey(key) {
+					problem = "unknown import {label}"
+					break
+				}
+				let e = provided[key]
+				let fits = e.kind == entry.kind
+				if fits {
+					match entry.kind {
+						case ExternKind.Function:
+							fits = signatures[e.id] == signature(c.typeParams[entry.typeIndex], c.typeResults[entry.typeIndex])
+							c.funcIds.push(e.id)
+						case ExternKind.Table:
+							let t = tables[e.id]
+							fits = t.element == entry.table.element && within(t.elements.len(), t.bounded, t.max, entry.table.limits)
+							c.tableIds.push(e.id)
+						case ExternKind.Memory:
+							let memory = memories[e.id]
+							fits = within(memory.bytes.len() >> 16, memory.bounded, memory.max, entry.memory)
+							c.memoryId = e.id
+						case ExternKind.Global:
+							fits = e.content == entry.global.content && e.mutable == entry.global.mutable
+							c.globalSlots.push(e.id)
+					}
+				}
+				if !fits {
+					problem = "incompatible import type for {label}"
+					break
+				}
+			}
+			if problem != "" {
+				// An invalid module is reported as invalid first.
+				try c.compile()
+				fail unlinkable(problem)
+			}
+
+			for let i = 0; i < m.types.len(); i++ {
+				c.typeIds.push(signature(c.typeParams[i], c.typeResults[i]))
+			}
+			for let (_, t) in m.functions {
+				c.funcIds.push(entries.len())
+				entries.push(-1)
+				signatures.push(c.typeIds[t])
+				hostOf.push(-1)
+			}
+			for let (_, t) in m.tables {
+				c.tableIds.push(tables.len())
+				tables.push(new Table(t))
+			}
+			for let (_, limits) in m.memories {
+				c.memoryId = memories.len()
+				memories.push(new Memory(limits))
+			}
+			for let (_, g) in m.globals {
+				try evaluate(c, g.init)
+				c.globalSlots.push(globals.len())
+				globals.push(valueLow)
+				globals.push(valueHigh) when g.kind.content == ValueType.V128
+			}
+			c.dataBase = dataBytes.len()
+			for let (_, d) in m.datas {
+				dataBytes.push(m.bytes)
+				dataFrom.push(d.bytes.from)
+				dataTo.push(d.bytes.to)
+			}
+			c.elemBase = elems.len()
+			for let (_, e) in m.elements {
+				let refs int[]
+				for let (_, f) in e.functions {
+					refs.push(c.funcIds[f] + 1)
+				}
+				for let (_, x) in e.expressions {
+					try evaluate(c, x)
+					refs.push(valueLow)
+				}
+				elems.push(refs)
+			}
+
+			c.emitting = true
+			c.metered = metered
+			c.out = code
+			c.pool = pool
+			c.entries = entries
+			try c.compile()
+
+			let instance = new Linked(self)
+			for let (_, e) in m.exports {
+				let x = Extern{kind: e.kind}
+				match e.kind {
+					case ExternKind.Function:
+						x.id = c.funcIds[e.index]
+					case ExternKind.Table:
+						x.id = c.tableIds[e.index]
+					case ExternKind.Memory:
+						x.id = c.memoryId
+					case ExternKind.Global:
+						x.id = c.globalSlots[e.index]
+						x.content = c.globals[e.index].content
+						x.mutable = c.globals[e.index].mutable
+				}
+				instance.exports[m.bytes[e.bytes.from:e.bytes.to].hex()] = x
+			}
+
+			// Active segments are copied in order, then dropped like the
+			// declarative ones.
+			for let (i, e) in m.elements {
+				let id = c.elemBase + i
+				if e.mode == SegmentMode.Active {
+					try evaluate(c, e.offset)
+					let at = valueLow & 0xffffffff
+					let into = tables[c.tableIds[e.table]].elements
+					let refs = elems[id]
+					fail trap("out of bounds table access") when at + refs.len() > into.len()
+					for let k = 0; k < refs.len(); k++ {
+						into[at + k] = refs[k]
+					}
+				}
+				elems[id] = nothing unless e.mode == SegmentMode.Passive
+			}
+			for let (i, d) in m.datas {
+				continue unless d.mode == SegmentMode.Active
+				try evaluate(c, d.offset)
+				let at = valueLow & 0xffffffff
+				let into = memories[c.memoryId].bytes
+				let n = d.bytes.to - d.bytes.from
+				fail trap("out of bounds memory access") when at + n > into.len()
+				mem.moveN(into[at:], m.bytes[d.bytes.from:], n) when n > 0
+				dataTo[c.dataBase + i] = d.bytes.from
+			}
+			if m.hasStart {
+				let noArgs Value[]
+				try call(c.funcIds[m.start], noArgs)
+			}
+			return instance
+		}
+
+		// Whether a table or memory of `size`, growing to `max` when
+		// bounded, satisfies an import that asks for `want`.
+		internal def within(size int, bounded bool, max int, want Limits) bool {
+			return false when size < want.min
+			return true unless want.bounded
+			return bounded && max <= want.max
+		}
+
+		// Evaluates a constant expression of the module `c` compiles into
+		// valueLow and valueHigh.
+		internal def evaluate(c Compiler, span Span) !none {
+			let r = new Cursor(c.m.bytes, span.from, span.to)
+			valueHigh = 0
+			match try r.u8() {
+				case 0x41:
+					valueLow = try r.signed(32)
+				case 0x42:
+					valueLow = try r.signed(64)
+				case 0x43:
+					valueLow = try r.fixed(4)
+				case 0x44:
+					valueLow = try r.fixed(8)
+				case 0xfd:
+					try r.u32()
+					valueLow = try r.fixed(8)
+					valueHigh = try r.fixed(8)
+				case 0xd2:
+					valueLow = c.funcIds[try r.u32()] + 1
+				case 0x23:
+					let x = try r.u32()
+					let slot = c.globalSlots[x]
+					valueLow = globals[slot]
+					valueHigh = globals[slot + 1] when c.globals[x].content == ValueType.V128
+				default:
+					// ref.null
+					valueLow = 0
+			}
+			return none
+		}
+
+		// A value's bits as a frame slot holds them.
+		internal def slotBits(kind int, bits int) int {
+			return int(int32(bits)) when kind == codeI32
+			return bits & 0xffffffff when kind == codeF32
+			return bits
+		}
+
+		// Grows the value stack to hold `slots`.
+		// Fails with a Trap ("exhausted") beyond maxStack.
+		def reserve(slots int) !none {
+			return none when slots <= stack.len()
+			fail exhausted("call stack exhausted") when slots > maxStack
+			stack.len((stack.len() * 2).max(slots).min(maxStack))
+			return none
+		}
+
+		// Calls function `id` of the store.
+		// Fails with a Trap when the code traps, and with an error when the
+		// arguments do not match the function's parameters.
+		def call(id int, args Value[]) !Value[] {
+			let params = typeParams[signatures[id]]
+			let results = typeResults[signatures[id]]
+			fail "wasm: the function takes {params.len()} arguments, not {args.len()}" unless args.len() == params.len()
+			for let i = 0; i < params.len(); i++ {
+				fail "wasm: argument {i} is {args[i].kind.str().lower()}, the function takes {typeName(params[i])}" unless args[i].kind.value == params[i]
+			}
+			let out Value[]
+			if entries[id] < 0 {
+				let fn = hosts[hostOf[id]]
+				out = try fn(args)
+				try returned(results, out)
+				return out
+			}
+			let base = floor
+			try reserve(base + (params.len() + results.len()) * 2)
+			let at = base
+			for let i = 0; i < params.len(); i++ {
+				stack[at] = slotBits(params[i], args[i].bits)
+				at++
+				if params[i] == codeV128 {
+					stack[at] = args[i].high
+					at++
+				}
+			}
+			let depth = callTop
+			let failure ?error = none
+			execute(self, entries[id], base) onerror (err error) {
+				failure = err
+				recover none
+			}
+			callTop = depth
+			floor = base
+			fail failure unless failure is none
+			at = base
+			for let i = 0; i < results.len(); i++ {
+				let v = Value{kind: ValueType(results[i]), bits: stack[at]}
+				at++
+				if results[i] == codeV128 {
+					v.high = stack[at]
+					at++
+				}
+				out.push(v)
+			}
+			return out
+		}
+
+		// Checks what a host function returned against its type.
+		internal def returned(results int[], out Value[]) !none {
+			fail trap("a host function returned {out.len()} values, its type says {results.len()}") unless out.len() == results.len()
+			for let i = 0; i < results.len(); i++ {
+				fail trap("a host function returned {out[i].kind.str().lower()} where its type says {typeName(results[i])}") unless out[i].kind.value == results[i]
+			}
+			return none
+		}
+
+		// Calls the host function `id` for the code: its arguments are in
+		// the stack from `base`, where its results go.
+		// Fails with the function's error, and with a Trap when what it
+		// returns does not match its type.
+		def callHost(id int, base int) !none {
+			let params = typeParams[signatures[id]]
+			let results = typeResults[signatures[id]]
+			let args Value[]
+			let at = base
+			for let i = 0; i < params.len(); i++ {
+				let v = Value{kind: ValueType(params[i]), bits: stack[at]}
+				at++
+				if params[i] == codeV128 {
+					v.high = stack[at]
+					at++
+				}
+				args.push(v)
+			}
+			// The function may call back into the store: above what this
+			// call uses.
+			let saved = floor
+			floor = at.max(base + results.len() * 2)
+			let fn = hosts[hostOf[id]]
+			let out = try fn(args)
+			floor = saved
+			try returned(results, out)
+			try reserve(base + results.len() * 2)
+			at = base
+			for let i = 0; i < results.len(); i++ {
+				stack[at] = slotBits(results[i], out[i].bits)
+				at++
+				if results[i] == codeV128 {
+					stack[at] = out[i].high
+					at++
+				}
+			}
+			return none
+		}
+	}
+}

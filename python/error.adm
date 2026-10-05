@@ -1,0 +1,57 @@
+partial module adm.interop.python {
+	use std.errors
+
+	// What a Python value is.
+	enum Kind {
+		None,
+		Bool,
+		Int,
+		Float,
+		// A str.
+		String,
+		// A bytes or a bytearray.
+		Bytes,
+		List,
+		Tuple,
+		Dict,
+		// Anything a script can call: a function, a method, a class.
+		Function,
+		Module,
+		// Any other object: an instance, a set, an exception.
+		Object,
+		// An ADM object the script holds without seeing inside it.
+		Foreign
+	}
+
+	// Why a script failed.
+	enum ScriptFailure {
+		// The script raised an exception.
+		Thrown,
+		// Runtime.interrupt stopped it.
+		Interrupted,
+		// It ran longer than the runtime's timeout.
+		TimedOut,
+		// It needed more memory than the runtime's limit.
+		OutOfMemory,
+		// The runtime is closed, or was never opened.
+		Closed,
+		// A value was not what the caller asked for.
+		Conversion
+	}
+
+	// ScriptError is the failure of a script or of a conversion. A handler
+	// that narrows with `err is ScriptError` reads `kind`, the Python
+	// traceback (`trace`) and the exception itself.
+	struct ScriptError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ScriptFailure
+		// The traceback as Python prints it; "" when there is none.
+		trace   string
+		// The exception the script raised; none for failures that are not
+		// exceptions.
+		value   ?Value
+	}
+}

@@ -1,0 +1,443 @@
+internal partial module adm.interop.wasm.engine {
+	use adm.interop.wasm::*
+	// Decodes a WebAssembly binary: every section, and every instruction of
+	// every function body and constant expression, is checked against the
+	// binary format. The module is not validated: types, indexes and stack
+	// use are checked when it is instantiated.
+	// Fails with a ModuleError when the bytes are not a well-formed module.
+	def decodeBinary(bytes byte[]) !Binary {
+		let m = new Binary()
+		m.bytes = bytes
+		let c = new Cursor(bytes, 0, bytes.len())
+		fail malformed(0, "unexpected end") when bytes.len() < 4
+		fail malformed(0, "magic header not detected") unless bytes[0] == 0 && bytes[1] == 0x61 && bytes[2] == 0x73 && bytes[3] == 0x6d
+		fail malformed(4, "unexpected end") when bytes.len() < 8
+		fail malformed(4, "unknown binary version") unless bytes[4] == 1 && bytes[5] == 0 && bytes[6] == 0 && bytes[7] == 0
+		c.at = 8
+
+		// Sections other than custom ones come at most once, in this order.
+		let last = 0
+		for c.more() {
+			let id = try c.u8()
+			let size = try c.u32()
+			fail malformed(c.at, "unexpected end") when c.at + size > c.end
+			let s = new Cursor(bytes, c.at, c.at + size)
+			if id != 0 {
+				let rank = sectionRank(id)
+				fail malformed(c.at, "malformed section id") when rank == 0
+				fail malformed(c.at, "unexpected content after last section") when rank <= last
+				last = rank
+			}
+			match id {
+				case 0:
+					let name = try s.name()
+					m.customs.push(CustomSection{name: name, bytes: Span{from: s.at, to: s.end}})
+					s.at = s.end
+				case 1:
+					try types(m, s)
+				case 2:
+					try imports(m, s)
+				case 3:
+					let n = try s.u32()
+					for let i = 0; i < n; i++ {
+						m.functions.push(try s.u32())
+					}
+				case 4:
+					let n = try s.u32()
+					for let i = 0; i < n; i++ {
+						m.tables.push(try tableType(s))
+					}
+				case 5:
+					let n = try s.u32()
+					for let i = 0; i < n; i++ {
+						m.memories.push(try limits(s))
+					}
+				case 6:
+					let n = try s.u32()
+					for let i = 0; i < n; i++ {
+						let kind = try globalType(s)
+						m.globals.push(Global{kind: kind, init: try expression(m, s)})
+					}
+				case 7:
+					let n = try s.u32()
+					for let i = 0; i < n; i++ {
+						let name = try s.name()
+						let kind = try externKind(s)
+						m.exports.push(Exported{name: name, bytes: s.named, kind: kind, index: try s.u32()})
+					}
+				case 8:
+					m.start = try s.u32()
+					m.hasStart = true
+				case 9:
+					let n = try s.u32()
+					for let i = 0; i < n; i++ {
+						m.elements.push(try element(m, s))
+					}
+				case 10:
+					let n = try s.u32()
+					fail malformed(s.at, "function and code section have inconsistent lengths") unless n == m.functions.len()
+					for let i = 0; i < n; i++ {
+						m.bodies.push(try body(m, s))
+					}
+				case 11:
+					let n = try s.u32()
+					fail malformed(s.at, "data count and data section have inconsistent lengths") when m.hasDataCount && n != m.dataCount
+					for let i = 0; i < n; i++ {
+						m.datas.push(try data(m, s))
+					}
+				case 12:
+					m.dataCount = try s.u32()
+					m.hasDataCount = true
+				default:
+					fail malformed(c.at, "malformed section id")
+			}
+			fail malformed(s.at, "section size mismatch") unless s.at == s.end
+			c.at = s.end
+		}
+		fail malformed(c.end, "function and code section have inconsistent lengths") unless m.bodies.len() == m.functions.len()
+		fail malformed(c.end, "data count and data section have inconsistent lengths") when m.hasDataCount && m.dataCount != m.datas.len()
+		return m
+	}
+
+	// Where a section stands in the order sections must follow; 0 for an
+	// id that is not a section.
+	def sectionRank(id int) int {
+		match id {
+			case 1, 2, 3, 4, 5, 6, 7, 8, 9:
+				return id
+			case 12:
+				return 10
+			case 10:
+				return 11
+			case 11:
+				return 12
+			default:
+		}
+		return 0
+	}
+
+	def valueType(c Cursor) !ValueType {
+		let at = c.at
+		let b = try c.u8()
+		match b {
+			case 0x7f:
+				return ValueType.I32
+			case 0x7e:
+				return ValueType.I64
+			case 0x7d:
+				return ValueType.F32
+			case 0x7c:
+				return ValueType.F64
+			case 0x7b:
+				return ValueType.V128
+			case 0x70:
+				return ValueType.FuncRef
+			case 0x6f:
+				return ValueType.ExternRef
+			default:
+		}
+		fail malformed(at, "malformed value type")
+	}
+
+	def referenceType(c Cursor) !ValueType {
+		let at = c.at
+		let t = try valueType(c)
+		fail malformed(at, "malformed reference type") unless t := ValueType.FuncRef || ValueType.ExternRef
+		return t
+	}
+
+	def limits(c Cursor) !Limits {
+		let at = c.at
+		let flag = try c.u8()
+		fail malformed(at, "integer too large") when flag > 1
+		let min = try c.u32()
+		return Limits{min: min} when flag == 0
+		return Limits{min: min, max: try c.u32(), bounded: true}
+	}
+
+	def tableType(c Cursor) !TableType {
+		let element = try referenceType(c)
+		return TableType{element: element, limits: try limits(c)}
+	}
+
+	def globalType(c Cursor) !GlobalType {
+		let content = try valueType(c)
+		let at = c.at
+		let flag = try c.u8()
+		fail malformed(at, "malformed mutability") when flag > 1
+		return GlobalType{content: content, mutable: flag == 1}
+	}
+
+	def externKind(c Cursor) !ExternKind {
+		let at = c.at
+		let b = try c.u8()
+		fail malformed(at, "malformed import kind") when b > 3
+		return ExternKind(b)
+	}
+
+	def types(m Binary, s Cursor) !none {
+		let n = try s.u32()
+		for let i = 0; i < n; i++ {
+			let at = s.at
+			fail malformed(at, "integer representation too long") unless try s.u8() == 0x60
+			let t = FunctionType{}
+			let params = try s.u32()
+			for let k = 0; k < params; k++ {
+				t.params.push(try valueType(s))
+			}
+			let results = try s.u32()
+			for let k = 0; k < results; k++ {
+				t.results.push(try valueType(s))
+			}
+			m.types.push(t)
+		}
+		return none
+	}
+
+	def imports(m Binary, s Cursor) !none {
+		let n = try s.u32()
+		for let i = 0; i < n; i++ {
+			let moduleName = try s.name()
+			let moduleBytes = s.named
+			let name = try s.name()
+			let entry = Imported{moduleName: moduleName, moduleBytes: moduleBytes, name: name, bytes: s.named, kind: try externKind(s)}
+			match entry.kind {
+				case ExternKind.Function:
+					entry.typeIndex = try s.u32()
+				case ExternKind.Table:
+					entry.table = try tableType(s)
+				case ExternKind.Memory:
+					entry.memory = try limits(s)
+				case ExternKind.Global:
+					entry.global = try globalType(s)
+			}
+			m.imports.push(entry)
+		}
+		return none
+	}
+
+	// The kind byte of an element segment that lists function indexes: 0.
+	def elementKind(s Cursor) !ValueType {
+		let at = s.at
+		fail malformed(at, "malformed element kind") unless try s.u8() == 0
+		return ValueType.FuncRef
+	}
+
+	def element(m Binary, s Cursor) !Element {
+		let at = s.at
+		let flags = try s.u32()
+		fail malformed(at, "malformed elements segment kind") when flags > 7
+		// Bit 0: passive or declarative. Bit 1: an explicit table index for
+		// an active segment, declarative otherwise. Bit 2: expressions.
+		let e = Element{kind: ValueType.FuncRef}
+		let expressions = (flags & 4) != 0
+		if (flags & 1) == 0 {
+			e.mode = SegmentMode.Active
+			e.table = try s.u32() when (flags & 2) != 0
+			e.offset = try expression(m, s)
+		} else {
+			e.mode = (flags & 2) != 0 ?? (SegmentMode.Declarative, SegmentMode.Passive)
+		}
+		e.kind = expressions ?? (try referenceType(s), try elementKind(s)) when (flags & 3) != 0
+		let n = try s.u32()
+		for let i = 0; i < n; i++ {
+			if expressions {
+				e.expressions.push(try expression(m, s))
+			} else {
+				e.functions.push(try s.u32())
+			}
+		}
+		return e
+	}
+
+	def data(m Binary, s Cursor) !Data {
+		let at = s.at
+		let flags = try s.u32()
+		fail malformed(at, "malformed data segment kind") when flags > 2
+		let d = Data{}
+		if flags == 1 {
+			d.mode = SegmentMode.Passive
+		} else {
+			d.mode = SegmentMode.Active
+			d.memory = try s.u32() when flags == 2
+			d.offset = try expression(m, s)
+		}
+		let n = try s.u32()
+		d.bytes = try s.span(n)
+		return d
+	}
+
+	def body(m Binary, s Cursor) !Body {
+		let size = try s.u32()
+		fail malformed(s.at, "unexpected end") when s.at + size > s.end
+		let c = new Cursor(s.data, s.at, s.at + size)
+		let b = Body{}
+		let runs = try c.u32()
+		for let i = 0; i < runs; i++ {
+			let at = c.at
+			let count = try c.u32()
+			b.localCount += count
+			fail malformed(at, "too many locals") when b.localCount > 0xffffffff
+			b.locals.push(Locals{count: count, kind: try valueType(c)})
+		}
+		b.code = try expression(m, c)
+		b.constants = c.constants
+		fail malformed(c.at, "section size mismatch") unless c.at == c.end
+		s.at = c.end
+		return b
+	}
+
+	// Walks one expression: instructions up to the `end` that closes it,
+	// which is consumed. Returns the bytes it covers, the `end` included.
+	def expression(m Binary, c Cursor) !Span {
+		let from = c.at
+		let depth = 0
+		for {
+			let at = c.at
+			let op = try c.u8()
+			match op {
+				case 0x02, 0x03, 0x04:
+					// block, loop, if: a block type.
+					depth++
+					let t = c.peek()
+					if t := 0x40 || 0x7f || 0x7e || 0x7d || 0x7c || 0x7b || 0x70 || 0x6f {
+						c.at++
+					} else {
+						fail malformed(c.at, "malformed block type") when try c.signed(33) < 0
+					}
+				case 0x0b:
+					return Span{from: from, to: c.at} when depth == 0
+					depth--
+				case 0x0c, 0x0d, 0x10, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26:
+					// One index: a label, function, local, global or table.
+					try c.u32()
+				case 0x0e:
+					let n = try c.u32()
+					for let i = 0; i <= n; i++ {
+						try c.u32()
+					}
+				case 0x11:
+					try c.u32()
+					try c.u32()
+				case 0x1c:
+					let n = try c.u32()
+					for let i = 0; i < n; i++ {
+						try valueType(c)
+					}
+				case 0x3f, 0x40:
+					fail malformed(c.at, "zero byte expected") unless try c.u8() == 0
+				case 0x41:
+					try c.signed(32)
+					c.constants++
+				case 0x42:
+					try c.signed(64)
+					c.constants++
+				case 0x43:
+					try c.skip(4)
+					c.constants++
+				case 0x44:
+					try c.skip(8)
+					c.constants++
+				case 0xd0:
+					try referenceType(c)
+					c.constants++
+				case 0xd2:
+					try c.u32()
+					c.constants++
+				case 0xfc:
+					try saturating(m, c)
+				case 0xfd:
+					try vector(c)
+				default:
+					if op >= 0x28 && op <= 0x3e {
+						try memoryArgument(c)
+					} else {
+						// The rest take no immediates: control (0x00, 0x01,
+						// 0x05, 0x0f), drop and select (0x1a, 0x1b), numeric
+						// (0x45 to 0xc4) and ref.is_null (0xd1).
+						let plain = op <= 0x01 || op == 0x05 || op == 0x0f || op == 0x1a || op == 0x1b || (op >= 0x45 && op <= 0xc4) || op == 0xd1
+						fail malformed(at, "illegal opcode") unless plain
+					}
+			}
+		}
+		return Span{from: from, to: c.at}
+	}
+
+	// The immediate of a load or a store: the alignment, as a power of two,
+	// and the offset.
+	def memoryArgument(c Cursor) !none {
+		let at = c.at
+		fail malformed(at, "malformed memop flags") when try c.u32() >= 32
+		try c.u32()
+		return none
+	}
+
+	// The immediates of an instruction behind the 0xfc prefix: saturating
+	// truncations and the bulk memory and table instructions.
+	def saturating(m Binary, c Cursor) !none {
+		let at = c.at
+		let op = try c.u32()
+		match op {
+			case 0, 1, 2, 3, 4, 5, 6, 7:
+			case 8:
+				// memory.init
+				fail malformed(at, "data count section required") unless m.hasDataCount
+				try c.u32()
+				fail malformed(c.at, "zero byte expected") unless try c.u8() == 0
+			case 9:
+				// data.drop
+				fail malformed(at, "data count section required") unless m.hasDataCount
+				try c.u32()
+			case 10:
+				// memory.copy
+				fail malformed(c.at, "zero byte expected") unless try c.u8() == 0
+				fail malformed(c.at, "zero byte expected") unless try c.u8() == 0
+			case 11:
+				// memory.fill
+				fail malformed(c.at, "zero byte expected") unless try c.u8() == 0
+			case 12, 14:
+				// table.init, table.copy
+				try c.u32()
+				try c.u32()
+			case 13, 15, 16, 17:
+				// elem.drop, table.grow, table.size, table.fill
+				try c.u32()
+			default:
+				fail malformed(at, "illegal opcode")
+		}
+		return none
+	}
+
+	// The immediates of a vector instruction (behind the 0xfd prefix).
+	def vector(c Cursor) !none {
+		let at = c.at
+		let op = try c.u32()
+		if op <= 11 || op == 92 || op == 93 {
+			try memoryArgument(c)
+			return none
+		}
+		if op := 12 || 13 {
+			// v128.const and i8x16.shuffle: 16 bytes.
+			try c.skip(16)
+			return none
+		}
+		if op >= 21 && op <= 34 {
+			// extract_lane and replace_lane: a lane.
+			try c.skip(1)
+			return none
+		}
+		if op >= 84 && op <= 91 {
+			// Loads and stores of one lane: a memory argument and a lane.
+			try memoryArgument(c)
+			try c.skip(1)
+			return none
+		}
+		fail malformed(at, "illegal opcode") when op > 255 || unassignedVector(op)
+		return none
+	}
+
+	// Whether a vector opcode below 256 names no instruction.
+	def unassignedVector(op int) bool {
+		return op := 0x9a || 0xa2 || 0xa5 || 0xa6 || 0xaf || 0xb0 || 0xb2 || 0xb3 || 0xb4 || 0xbb || 0xc2 || 0xc5 || 0xc6 || 0xcf || 0xd0 || 0xd2 || 0xd3 || 0xd4 || 0xe2 || 0xee
+	}
+}

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The assembly dotnet_test.adm calls. Build it and keep the assembly beside this file:
+       dotnet build -c Release -o out && cp out/Sample.dll . -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Sample</AssemblyName>
+    <Nullable>enable</Nullable>
+    <DebugType>none</DebugType>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>

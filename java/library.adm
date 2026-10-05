@@ -1,0 +1,13 @@
+// Java inside an ADM program: the installed Java VM, loaded at run time.
+@manifest(version = "0.1.0")
+library adm.interop.java {
+	use (
+		adm.interop.java
+		adm.interop.java.engine
+		adm.interop.java.jni
+	)
+
+	export (
+		adm.interop.java
+	)
+}

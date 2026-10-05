@@ -1,0 +1,841 @@
+internal partial module adm.interop.wasm.engine {
+	use (
+		adm.interop.wasm::*
+		std.simd
+	)
+	// The vector instructions. A v128 is two frame slots, its low and high
+	// 64 bits. Most instructions run on a hardware vector (std.simd): the two
+	// slots are loaded as one, reread with the instruction's lanes, and the
+	// result is stored back. Those std.simd has no exact operation for
+	// (the saturating conversions, min and max with WebAssembly's NaN and
+	// zero rules, nearest, narrow, extend, shuffle) split their operands
+	// into lanes, as unsigned integers in the store's lanesA and lanesB,
+	// compute lanesR and pack it.
+
+	// The lanes of `bits` bits of the v128 (low, high), zero-extended.
+	def unpack(low int, high int, bits int, out int[]) {
+		if bits == 64 {
+			out[0] = low
+			out[1] = high
+			return
+		}
+		let half = 64 / bits
+		let mask = (1 << bits) - 1
+		for let i = 0; i < half; i++ {
+			out[i] = (low >> (i * bits)) & mask
+			out[half + i] = (high >> (i * bits)) & mask
+		}
+	}
+
+	// Stores lanes of `bits` bits as the v128 at slot `to`.
+	def pack(lanes int[], bits int, s int[], to int) {
+		if bits == 64 {
+			s[to] = lanes[0]
+			s[to + 1] = lanes[1]
+			return
+		}
+		let half = 64 / bits
+		let mask = (1 << bits) - 1
+		let low = 0
+		let high = 0
+		for let i = 0; i < half; i++ {
+			low |= (lanes[i] & mask) << (i * bits)
+			high |= (lanes[half + i] & mask) << (i * bits)
+		}
+		s[to] = low
+		s[to + 1] = high
+	}
+
+	// A lane of `bits` bits as a signed integer.
+	def signedLane(v int, bits int) int {
+		return (v << (64 - bits)) >> (64 - bits)
+	}
+
+	// v held within the signed integers of `bits` bits.
+	def clampSigned(v int, bits int) int {
+		let top = (1 << (bits - 1)) - 1
+		return top when v > top
+		return -top - 1 when v < -top - 1
+		return v
+	}
+
+	// v held within the unsigned integers of `bits` bits.
+	def clampUnsigned(v int, bits int) int {
+		return 0 when v < 0
+		return (1 << bits) - 1 when v > (1 << bits) - 1
+		return v
+	}
+
+	// i16x8.q15mulr_sat_s on two lanes: the rounded high half of the product
+	// of two Q15 numbers. Only -32768 * -32768 overflows.
+	def q15(x int, y int) int {
+		let p = (signedLane(x, 16) * signedLane(y, 16) + 0x4000) >> 15
+		return p > 32767 ?? (32767, p)
+	}
+
+	// Runs the vector instruction `w`; `next` is the index of the word
+	// after it. Returns where the following instruction is.
+	// Fails with a Trap when a load or a store is out of the memory's bounds.
+	def vectorExecute(st Machine, s int[], m byte[], code int[], w int, next int, fp int) !int {
+		let pc = next
+		let op = (w & 0xffff) - 0x200
+		let a = fp + ((w >> 16) & 0xffff)
+		let b = fp + ((w >> 32) & 0xffff)
+		let c = fp + ((w >> 48) & 0xffff)
+		let x = st.lanesA
+		let y = st.lanesB
+		let r = st.lanesR
+
+		// The instructions a hardware vector computes whole: the two slots
+		// are read as one 128-bit vector, reread with the lanes the
+		// instruction works on, and the result is stored the same way. An
+		// instruction may write the slots it reads: both operands are
+		// loaded before the store.
+		match op {
+			case 0x00:
+				// v128.load and v128.store: sixteen bytes of the memory as they are.
+				let at = (s[b] & 0xffffffff) + code[pc]
+				fail trap("out of bounds memory access") when at + 16 > m.len()
+				simd.store2(s, a, simd.load16<byte>(m, at).bitcast2<int>())
+				return pc + 1
+			case 0x0b:
+				let at = (s[a] & 0xffffffff) + code[pc]
+				fail trap("out of bounds memory access") when at + 16 > m.len()
+				simd.store16(m, at, simd.load2<int>(s, b).bitcast16<byte>())
+				return pc + 1
+			case 0x0f:
+				// The splats: one value in every lane.
+				simd.store2(s, a, simd.splat16<int8>(int8(s[b])).bitcast2<int>())
+				return pc
+			case 0x10:
+				simd.store2(s, a, simd.splat8<int16>(int16(s[b])).bitcast2<int>())
+				return pc
+			case 0x11:
+				simd.store2(s, a, simd.splat4<int32>(int32(s[b])).bitcast2<int>())
+				return pc
+			case 0x13:
+				simd.store2(s, a, simd.splat4<int32>(int32(s[b])).bitcast2<int>())
+				return pc
+			case 0x12, 0x14:
+				simd.store2(s, a, simd.splat2<int>(s[b]))
+				return pc
+			case 0x15:
+				// extract_lane: the lane is the third operand. A signed lane and an
+				// i32 are sign-extended, an f32 is its bits.
+				s[a] = int(simd.load2<int>(s, b).bitcast16<int8>().lane((w >> 48) & 0xffff))
+				return pc
+			case 0x16:
+				s[a] = int(simd.load2<int>(s, b).bitcast16<uint8>().lane((w >> 48) & 0xffff))
+				return pc
+			case 0x18:
+				s[a] = int(simd.load2<int>(s, b).bitcast8<int16>().lane((w >> 48) & 0xffff))
+				return pc
+			case 0x19:
+				s[a] = int(simd.load2<int>(s, b).bitcast8<uint16>().lane((w >> 48) & 0xffff))
+				return pc
+			case 0x1b:
+				s[a] = int(simd.load2<int>(s, b).bitcast4<int32>().lane((w >> 48) & 0xffff))
+				return pc
+			case 0x1f:
+				s[a] = int(simd.load2<int>(s, b).bitcast4<uint32>().lane((w >> 48) & 0xffff))
+				return pc
+			case 0x1d, 0x21:
+				s[a] = simd.load2<int>(s, b).lane((w >> 48) & 0xffff)
+				return pc
+			case 0x17:
+				// replace_lane: the lane follows.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().withLane(code[pc], int8(s[c])).bitcast2<int>())
+				return pc + 1
+			case 0x1a:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().withLane(code[pc], int16(s[c])).bitcast2<int>())
+				return pc + 1
+			case 0x1c, 0x20:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().withLane(code[pc], int32(s[c])).bitcast2<int>())
+				return pc + 1
+			case 0x1e, 0x22:
+				simd.store2(s, a, simd.load2<int>(s, b).withLane(code[pc], s[c]))
+				return pc + 1
+			case 0x23:
+				// i8x16: comparisons give all ones or zero in each lane.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().eq(simd.load2<int>(s, c).bitcast16<int8>()).blend(simd.splat16<int8>(int8(-1)), simd.splat16<int8>(int8(0))).bitcast2<int>())
+				return pc
+			case 0x24:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().ne(simd.load2<int>(s, c).bitcast16<int8>()).blend(simd.splat16<int8>(int8(-1)), simd.splat16<int8>(int8(0))).bitcast2<int>())
+				return pc
+			case 0x25:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().lt(simd.load2<int>(s, c).bitcast16<int8>()).blend(simd.splat16<int8>(int8(-1)), simd.splat16<int8>(int8(0))).bitcast2<int>())
+				return pc
+			case 0x26:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().lt(simd.load2<int>(s, c).bitcast16<uint8>()).blend(simd.splat16<uint8>(uint8(0) - uint8(1)), simd.splat16<uint8>(uint8(0))).bitcast2<int>())
+				return pc
+			case 0x27:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().gt(simd.load2<int>(s, c).bitcast16<int8>()).blend(simd.splat16<int8>(int8(-1)), simd.splat16<int8>(int8(0))).bitcast2<int>())
+				return pc
+			case 0x28:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().gt(simd.load2<int>(s, c).bitcast16<uint8>()).blend(simd.splat16<uint8>(uint8(0) - uint8(1)), simd.splat16<uint8>(uint8(0))).bitcast2<int>())
+				return pc
+			case 0x29:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().le(simd.load2<int>(s, c).bitcast16<int8>()).blend(simd.splat16<int8>(int8(-1)), simd.splat16<int8>(int8(0))).bitcast2<int>())
+				return pc
+			case 0x2a:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().le(simd.load2<int>(s, c).bitcast16<uint8>()).blend(simd.splat16<uint8>(uint8(0) - uint8(1)), simd.splat16<uint8>(uint8(0))).bitcast2<int>())
+				return pc
+			case 0x2b:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().ge(simd.load2<int>(s, c).bitcast16<int8>()).blend(simd.splat16<int8>(int8(-1)), simd.splat16<int8>(int8(0))).bitcast2<int>())
+				return pc
+			case 0x2c:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().ge(simd.load2<int>(s, c).bitcast16<uint8>()).blend(simd.splat16<uint8>(uint8(0) - uint8(1)), simd.splat16<uint8>(uint8(0))).bitcast2<int>())
+				return pc
+			case 0x60:
+				// i8x16: abs, neg, all_true, bitmask, shifts, arithmetic.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().abs().bitcast2<int>())
+				return pc
+			case 0x61:
+				simd.store2(s, a, simd.splat16<int8>(int8(0)).sub(simd.load2<int>(s, b).bitcast16<int8>()).bitcast2<int>())
+				return pc
+			case 0x62:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().popcount().bitcast2<int>())
+				return pc
+			case 0x63:
+				s[a] = simd.load2<int>(s, b).bitcast16<int8>().ne(simd.splat16<int8>(int8(0))).all() ?? (1, 0)
+				return pc
+			case 0x64:
+				s[a] = int(simd.load2<int>(s, b).bitcast16<int8>().lt(simd.splat16<int8>(int8(0))).bits())
+				return pc
+			case 0x6b:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().shl(s[c] & 7).bitcast2<int>())
+				return pc
+			case 0x6c:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().shr(s[c] & 7).bitcast2<int>())
+				return pc
+			case 0x6d:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().shr(s[c] & 7).bitcast2<int>())
+				return pc
+			case 0x6e:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().add(simd.load2<int>(s, c).bitcast16<int8>()).bitcast2<int>())
+				return pc
+			case 0x71:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().sub(simd.load2<int>(s, c).bitcast16<int8>()).bitcast2<int>())
+				return pc
+			case 0x6f:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().addSat(simd.load2<int>(s, c).bitcast16<int8>()).bitcast2<int>())
+				return pc
+			case 0x70:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().addSat(simd.load2<int>(s, c).bitcast16<uint8>()).bitcast2<int>())
+				return pc
+			case 0x72:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().subSat(simd.load2<int>(s, c).bitcast16<int8>()).bitcast2<int>())
+				return pc
+			case 0x73:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().subSat(simd.load2<int>(s, c).bitcast16<uint8>()).bitcast2<int>())
+				return pc
+			case 0x76:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().min(simd.load2<int>(s, c).bitcast16<int8>()).bitcast2<int>())
+				return pc
+			case 0x77:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().min(simd.load2<int>(s, c).bitcast16<uint8>()).bitcast2<int>())
+				return pc
+			case 0x78:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<int8>().max(simd.load2<int>(s, c).bitcast16<int8>()).bitcast2<int>())
+				return pc
+			case 0x79:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast16<uint8>().max(simd.load2<int>(s, c).bitcast16<uint8>()).bitcast2<int>())
+				return pc
+			case 0x2d:
+				// i16x8: comparisons give all ones or zero in each lane.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().eq(simd.load2<int>(s, c).bitcast8<int16>()).blend(simd.splat8<int16>(int16(-1)), simd.splat8<int16>(int16(0))).bitcast2<int>())
+				return pc
+			case 0x2e:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().ne(simd.load2<int>(s, c).bitcast8<int16>()).blend(simd.splat8<int16>(int16(-1)), simd.splat8<int16>(int16(0))).bitcast2<int>())
+				return pc
+			case 0x2f:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().lt(simd.load2<int>(s, c).bitcast8<int16>()).blend(simd.splat8<int16>(int16(-1)), simd.splat8<int16>(int16(0))).bitcast2<int>())
+				return pc
+			case 0x30:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().lt(simd.load2<int>(s, c).bitcast8<uint16>()).blend(simd.splat8<uint16>(uint16(0) - uint16(1)), simd.splat8<uint16>(uint16(0))).bitcast2<int>())
+				return pc
+			case 0x31:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().gt(simd.load2<int>(s, c).bitcast8<int16>()).blend(simd.splat8<int16>(int16(-1)), simd.splat8<int16>(int16(0))).bitcast2<int>())
+				return pc
+			case 0x32:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().gt(simd.load2<int>(s, c).bitcast8<uint16>()).blend(simd.splat8<uint16>(uint16(0) - uint16(1)), simd.splat8<uint16>(uint16(0))).bitcast2<int>())
+				return pc
+			case 0x33:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().le(simd.load2<int>(s, c).bitcast8<int16>()).blend(simd.splat8<int16>(int16(-1)), simd.splat8<int16>(int16(0))).bitcast2<int>())
+				return pc
+			case 0x34:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().le(simd.load2<int>(s, c).bitcast8<uint16>()).blend(simd.splat8<uint16>(uint16(0) - uint16(1)), simd.splat8<uint16>(uint16(0))).bitcast2<int>())
+				return pc
+			case 0x35:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().ge(simd.load2<int>(s, c).bitcast8<int16>()).blend(simd.splat8<int16>(int16(-1)), simd.splat8<int16>(int16(0))).bitcast2<int>())
+				return pc
+			case 0x36:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().ge(simd.load2<int>(s, c).bitcast8<uint16>()).blend(simd.splat8<uint16>(uint16(0) - uint16(1)), simd.splat8<uint16>(uint16(0))).bitcast2<int>())
+				return pc
+			case 0x80:
+				// i16x8: abs, neg, all_true, bitmask, shifts, arithmetic.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().abs().bitcast2<int>())
+				return pc
+			case 0x81:
+				simd.store2(s, a, simd.splat8<int16>(int16(0)).sub(simd.load2<int>(s, b).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x83:
+				s[a] = simd.load2<int>(s, b).bitcast8<int16>().ne(simd.splat8<int16>(int16(0))).all() ?? (1, 0)
+				return pc
+			case 0x84:
+				s[a] = int(simd.load2<int>(s, b).bitcast8<int16>().lt(simd.splat8<int16>(int16(0))).bits())
+				return pc
+			case 0x8b:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().shl(s[c] & 15).bitcast2<int>())
+				return pc
+			case 0x8c:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().shr(s[c] & 15).bitcast2<int>())
+				return pc
+			case 0x8d:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().shr(s[c] & 15).bitcast2<int>())
+				return pc
+			case 0x8e:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().add(simd.load2<int>(s, c).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x91:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().sub(simd.load2<int>(s, c).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x8f:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().addSat(simd.load2<int>(s, c).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x90:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().addSat(simd.load2<int>(s, c).bitcast8<uint16>()).bitcast2<int>())
+				return pc
+			case 0x92:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().subSat(simd.load2<int>(s, c).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x93:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().subSat(simd.load2<int>(s, c).bitcast8<uint16>()).bitcast2<int>())
+				return pc
+			case 0x95:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().mul(simd.load2<int>(s, c).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x96:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().min(simd.load2<int>(s, c).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x97:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().min(simd.load2<int>(s, c).bitcast8<uint16>()).bitcast2<int>())
+				return pc
+			case 0x98:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<int16>().max(simd.load2<int>(s, c).bitcast8<int16>()).bitcast2<int>())
+				return pc
+			case 0x99:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast8<uint16>().max(simd.load2<int>(s, c).bitcast8<uint16>()).bitcast2<int>())
+				return pc
+			case 0x37:
+				// i32x4: comparisons give all ones or zero in each lane.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().eq(simd.load2<int>(s, c).bitcast4<int32>()).blend(simd.splat4<int32>(int32(-1)), simd.splat4<int32>(int32(0))).bitcast2<int>())
+				return pc
+			case 0x38:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().ne(simd.load2<int>(s, c).bitcast4<int32>()).blend(simd.splat4<int32>(int32(-1)), simd.splat4<int32>(int32(0))).bitcast2<int>())
+				return pc
+			case 0x39:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().lt(simd.load2<int>(s, c).bitcast4<int32>()).blend(simd.splat4<int32>(int32(-1)), simd.splat4<int32>(int32(0))).bitcast2<int>())
+				return pc
+			case 0x3a:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<uint32>().lt(simd.load2<int>(s, c).bitcast4<uint32>()).blend(simd.splat4<uint32>(uint32(0) - uint32(1)), simd.splat4<uint32>(uint32(0))).bitcast2<int>())
+				return pc
+			case 0x3b:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().gt(simd.load2<int>(s, c).bitcast4<int32>()).blend(simd.splat4<int32>(int32(-1)), simd.splat4<int32>(int32(0))).bitcast2<int>())
+				return pc
+			case 0x3c:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<uint32>().gt(simd.load2<int>(s, c).bitcast4<uint32>()).blend(simd.splat4<uint32>(uint32(0) - uint32(1)), simd.splat4<uint32>(uint32(0))).bitcast2<int>())
+				return pc
+			case 0x3d:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().le(simd.load2<int>(s, c).bitcast4<int32>()).blend(simd.splat4<int32>(int32(-1)), simd.splat4<int32>(int32(0))).bitcast2<int>())
+				return pc
+			case 0x3e:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<uint32>().le(simd.load2<int>(s, c).bitcast4<uint32>()).blend(simd.splat4<uint32>(uint32(0) - uint32(1)), simd.splat4<uint32>(uint32(0))).bitcast2<int>())
+				return pc
+			case 0x3f:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().ge(simd.load2<int>(s, c).bitcast4<int32>()).blend(simd.splat4<int32>(int32(-1)), simd.splat4<int32>(int32(0))).bitcast2<int>())
+				return pc
+			case 0x40:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<uint32>().ge(simd.load2<int>(s, c).bitcast4<uint32>()).blend(simd.splat4<uint32>(uint32(0) - uint32(1)), simd.splat4<uint32>(uint32(0))).bitcast2<int>())
+				return pc
+			case 0xa0:
+				// i32x4: abs, neg, all_true, bitmask, shifts, arithmetic.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().abs().bitcast2<int>())
+				return pc
+			case 0xa1:
+				simd.store2(s, a, simd.splat4<int32>(int32(0)).sub(simd.load2<int>(s, b).bitcast4<int32>()).bitcast2<int>())
+				return pc
+			case 0xa3:
+				s[a] = simd.load2<int>(s, b).bitcast4<int32>().ne(simd.splat4<int32>(int32(0))).all() ?? (1, 0)
+				return pc
+			case 0xa4:
+				s[a] = int(simd.load2<int>(s, b).bitcast4<int32>().lt(simd.splat4<int32>(int32(0))).bits())
+				return pc
+			case 0xab:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().shl(s[c] & 31).bitcast2<int>())
+				return pc
+			case 0xac:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().shr(s[c] & 31).bitcast2<int>())
+				return pc
+			case 0xad:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<uint32>().shr(s[c] & 31).bitcast2<int>())
+				return pc
+			case 0xae:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().add(simd.load2<int>(s, c).bitcast4<int32>()).bitcast2<int>())
+				return pc
+			case 0xb1:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().sub(simd.load2<int>(s, c).bitcast4<int32>()).bitcast2<int>())
+				return pc
+			case 0xb5:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().mul(simd.load2<int>(s, c).bitcast4<int32>()).bitcast2<int>())
+				return pc
+			case 0xb6:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().min(simd.load2<int>(s, c).bitcast4<int32>()).bitcast2<int>())
+				return pc
+			case 0xb7:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<uint32>().min(simd.load2<int>(s, c).bitcast4<uint32>()).bitcast2<int>())
+				return pc
+			case 0xb8:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<int32>().max(simd.load2<int>(s, c).bitcast4<int32>()).bitcast2<int>())
+				return pc
+			case 0xb9:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<uint32>().max(simd.load2<int>(s, c).bitcast4<uint32>()).bitcast2<int>())
+				return pc
+			case 0xd6:
+				// i64x2 has eq, ne and the signed comparisons.
+				simd.store2(s, a, simd.load2<int>(s, b).eq(simd.load2<int>(s, c)).blend(simd.splat2<int>(int(-1)), simd.splat2<int>(int(0))))
+				return pc
+			case 0xd7:
+				simd.store2(s, a, simd.load2<int>(s, b).ne(simd.load2<int>(s, c)).blend(simd.splat2<int>(int(-1)), simd.splat2<int>(int(0))))
+				return pc
+			case 0xd8:
+				simd.store2(s, a, simd.load2<int>(s, b).lt(simd.load2<int>(s, c)).blend(simd.splat2<int>(int(-1)), simd.splat2<int>(int(0))))
+				return pc
+			case 0xd9:
+				simd.store2(s, a, simd.load2<int>(s, b).gt(simd.load2<int>(s, c)).blend(simd.splat2<int>(int(-1)), simd.splat2<int>(int(0))))
+				return pc
+			case 0xda:
+				simd.store2(s, a, simd.load2<int>(s, b).le(simd.load2<int>(s, c)).blend(simd.splat2<int>(int(-1)), simd.splat2<int>(int(0))))
+				return pc
+			case 0xdb:
+				simd.store2(s, a, simd.load2<int>(s, b).ge(simd.load2<int>(s, c)).blend(simd.splat2<int>(int(-1)), simd.splat2<int>(int(0))))
+				return pc
+			case 0xc0:
+				// i64x2: abs, neg, all_true, bitmask, shifts, arithmetic.
+				simd.store2(s, a, simd.load2<int>(s, b).abs())
+				return pc
+			case 0xc1:
+				simd.store2(s, a, simd.splat2<int>(int(0)).sub(simd.load2<int>(s, b)))
+				return pc
+			case 0xc3:
+				s[a] = simd.load2<int>(s, b).ne(simd.splat2<int>(int(0))).all() ?? (1, 0)
+				return pc
+			case 0xc4:
+				s[a] = int(simd.load2<int>(s, b).lt(simd.splat2<int>(int(0))).bits())
+				return pc
+			case 0xcb:
+				simd.store2(s, a, simd.load2<int>(s, b).shl(s[c] & 63))
+				return pc
+			case 0xcc:
+				simd.store2(s, a, simd.load2<int>(s, b).shr(s[c] & 63))
+				return pc
+			case 0xcd:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<uint>().shr(s[c] & 63).bitcast<int>())
+				return pc
+			case 0xce:
+				simd.store2(s, a, simd.load2<int>(s, b).add(simd.load2<int>(s, c)))
+				return pc
+			case 0xd1:
+				simd.store2(s, a, simd.load2<int>(s, b).sub(simd.load2<int>(s, c)))
+				return pc
+			case 0xd5:
+				simd.store2(s, a, simd.load2<int>(s, b).mul(simd.load2<int>(s, c)))
+				return pc
+			case 0x41:
+				// f32x4: comparisons, then sqrt, the arithmetic and the roundings.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().eq(simd.load2<int>(s, c).bitcast4<float32>()).blend(simd.splat4<int32>(int32(-1)).bitcast<float32>(), simd.splat4<float32>(float32(0))).bitcast2<int>())
+				return pc
+			case 0x42:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().ne(simd.load2<int>(s, c).bitcast4<float32>()).blend(simd.splat4<int32>(int32(-1)).bitcast<float32>(), simd.splat4<float32>(float32(0))).bitcast2<int>())
+				return pc
+			case 0x43:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().lt(simd.load2<int>(s, c).bitcast4<float32>()).blend(simd.splat4<int32>(int32(-1)).bitcast<float32>(), simd.splat4<float32>(float32(0))).bitcast2<int>())
+				return pc
+			case 0x44:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().gt(simd.load2<int>(s, c).bitcast4<float32>()).blend(simd.splat4<int32>(int32(-1)).bitcast<float32>(), simd.splat4<float32>(float32(0))).bitcast2<int>())
+				return pc
+			case 0x45:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().le(simd.load2<int>(s, c).bitcast4<float32>()).blend(simd.splat4<int32>(int32(-1)).bitcast<float32>(), simd.splat4<float32>(float32(0))).bitcast2<int>())
+				return pc
+			case 0x46:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().ge(simd.load2<int>(s, c).bitcast4<float32>()).blend(simd.splat4<int32>(int32(-1)).bitcast<float32>(), simd.splat4<float32>(float32(0))).bitcast2<int>())
+				return pc
+			case 0xe3:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().sqrt().bitcast2<int>())
+				return pc
+			case 0xe4:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().add(simd.load2<int>(s, c).bitcast4<float32>()).bitcast2<int>())
+				return pc
+			case 0xe5:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().sub(simd.load2<int>(s, c).bitcast4<float32>()).bitcast2<int>())
+				return pc
+			case 0xe6:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().mul(simd.load2<int>(s, c).bitcast4<float32>()).bitcast2<int>())
+				return pc
+			case 0xe7:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().div(simd.load2<int>(s, c).bitcast4<float32>()).bitcast2<int>())
+				return pc
+			case 0xea:
+				simd.store2(s, a, simd.load2<int>(s, c).bitcast4<float32>().lt(simd.load2<int>(s, b).bitcast4<float32>()).blend(simd.load2<int>(s, c).bitcast4<float32>(), simd.load2<int>(s, b).bitcast4<float32>()).bitcast2<int>())
+				return pc
+			case 0xeb:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().lt(simd.load2<int>(s, c).bitcast4<float32>()).blend(simd.load2<int>(s, c).bitcast4<float32>(), simd.load2<int>(s, b).bitcast4<float32>()).bitcast2<int>())
+				return pc
+			case 0x67:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().ceil().bitcast2<int>())
+				return pc
+			case 0x68:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().floor().bitcast2<int>())
+				return pc
+			case 0x69:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast4<float32>().trunc().bitcast2<int>())
+				return pc
+			case 0x47:
+				// f64x2: comparisons, then sqrt, the arithmetic and the roundings.
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().eq(simd.load2<int>(s, c).bitcast<float64>()).blend(simd.splat2<int>(int(-1)).bitcast<float64>(), simd.splat2<float64>(float64(0))).bitcast<int>())
+				return pc
+			case 0x48:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().ne(simd.load2<int>(s, c).bitcast<float64>()).blend(simd.splat2<int>(int(-1)).bitcast<float64>(), simd.splat2<float64>(float64(0))).bitcast<int>())
+				return pc
+			case 0x49:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().lt(simd.load2<int>(s, c).bitcast<float64>()).blend(simd.splat2<int>(int(-1)).bitcast<float64>(), simd.splat2<float64>(float64(0))).bitcast<int>())
+				return pc
+			case 0x4a:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().gt(simd.load2<int>(s, c).bitcast<float64>()).blend(simd.splat2<int>(int(-1)).bitcast<float64>(), simd.splat2<float64>(float64(0))).bitcast<int>())
+				return pc
+			case 0x4b:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().le(simd.load2<int>(s, c).bitcast<float64>()).blend(simd.splat2<int>(int(-1)).bitcast<float64>(), simd.splat2<float64>(float64(0))).bitcast<int>())
+				return pc
+			case 0x4c:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().ge(simd.load2<int>(s, c).bitcast<float64>()).blend(simd.splat2<int>(int(-1)).bitcast<float64>(), simd.splat2<float64>(float64(0))).bitcast<int>())
+				return pc
+			case 0xef:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().sqrt().bitcast<int>())
+				return pc
+			case 0xf0:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().add(simd.load2<int>(s, c).bitcast<float64>()).bitcast<int>())
+				return pc
+			case 0xf1:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().sub(simd.load2<int>(s, c).bitcast<float64>()).bitcast<int>())
+				return pc
+			case 0xf2:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().mul(simd.load2<int>(s, c).bitcast<float64>()).bitcast<int>())
+				return pc
+			case 0xf3:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().div(simd.load2<int>(s, c).bitcast<float64>()).bitcast<int>())
+				return pc
+			case 0xf6:
+				simd.store2(s, a, simd.load2<int>(s, c).bitcast<float64>().lt(simd.load2<int>(s, b).bitcast<float64>()).blend(simd.load2<int>(s, c).bitcast<float64>(), simd.load2<int>(s, b).bitcast<float64>()).bitcast<int>())
+				return pc
+			case 0xf7:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().lt(simd.load2<int>(s, c).bitcast<float64>()).blend(simd.load2<int>(s, c).bitcast<float64>(), simd.load2<int>(s, b).bitcast<float64>()).bitcast<int>())
+				return pc
+			case 0x74:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().ceil().bitcast<int>())
+				return pc
+			case 0x75:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().floor().bitcast<int>())
+				return pc
+			case 0x7a:
+				simd.store2(s, a, simd.load2<int>(s, b).bitcast<float64>().trunc().bitcast<int>())
+				return pc
+			default:
+		}
+
+		if op <= 0x0a || op == 0x5c || op == 0x5d {
+			// The loads that extend, repeat or zero-fill what they read.
+			let at = (s[b] & 0xffffffff) + code[pc]
+			pc++
+			let size = 8
+			size = 1 << (op - 0x07) when op >= 0x07 && op <= 0x0a
+			size = 4 when op == 0x5c
+			fail trap("out of bounds memory access") when at + size > m.len()
+			if op >= 0x5c {
+				s[a] = op == 0x5c ?? (read32(m, at), read64(m, at))
+				s[a + 1] = 0
+				return pc
+			}
+			if op <= 0x06 {
+				// Eight bytes, each lane extended to twice its width.
+				let from = 8 << ((op - 1) / 2)
+				unpack(read64(m, at), 0, from, x)
+				for let i = 0; i < 64 / from; i++ {
+					r[i] = (op & 1) == 1 ?? (signedLane(x[i], from), x[i])
+				}
+				pack(r, from * 2, s, a)
+				return pc
+			}
+			// One value repeated in every lane.
+			let bits = size * 8
+			let v = int(m[at])
+			v = read16(m, at) when size == 2
+			v = read32(m, at) when size == 4
+			v = read64(m, at) when size == 8
+			for let i = 0; i < 128 / bits; i++ {
+				r[i] = v
+			}
+			pack(r, bits, s, a)
+			return pc
+		}
+		if op >= 0x54 && op <= 0x5b {
+			// One lane loaded (a the result, b the address, c the vector)
+			// or stored (a the address, b the vector).
+			let k = code[pc]
+			pc++
+			let lane = k >> 32
+			let size = 1 << ((op - 0x54) & 3)
+			let loads = op <= 0x57
+			let at = (s[loads ?? (b, a)] & 0xffffffff) + (k & 0xffffffff)
+			fail trap("out of bounds memory access") when at + size > m.len()
+			let from = loads ?? (c, b)
+			unpack(s[from], s[from + 1], size * 8, x)
+			if loads {
+				let v = int(m[at])
+				v = read16(m, at) when size == 2
+				v = read32(m, at) when size == 4
+				v = read64(m, at) when size == 8
+				x[lane] = v
+				pack(x, size * 8, s, a)
+				return pc
+			}
+			match size {
+				case 1:
+					m[at] = byte(x[lane] & 0xff)
+				case 2:
+					write16(m, at, x[lane])
+				case 4:
+					write32(m, at, x[lane])
+				default:
+					write64(m, at, x[lane])
+			}
+			return pc
+		}
+		if op == 0x0d {
+			// i8x16.shuffle: the sixteen lane numbers follow, 16 and up
+			// naming the second vector.
+			unpack(s[b], s[b + 1], 8, x)
+			unpack(s[c], s[c + 1], 8, y)
+			let picks = st.lanesP
+			unpack(code[pc], code[pc + 1], 8, picks)
+			for let i = 0; i < 16; i++ {
+				r[i] = picks[i] < 16 ?? (x[picks[i] & 15], y[picks[i] & 15])
+			}
+			pack(r, 8, s, a)
+			return pc + 2
+		}
+		if op == 0x0e {
+			// i8x16.swizzle: a lane number of 16 or more gives 0.
+			unpack(s[b], s[b + 1], 8, x)
+			unpack(s[c], s[c + 1], 8, y)
+			for let i = 0; i < 16; i++ {
+				r[i] = y[i] < 16 ?? (x[y[i] & 15], 0)
+			}
+			pack(r, 8, s, a)
+			return pc
+		}
+		if op >= 0x4d && op <= 0x53 {
+			// The bitwise instructions work on the halves.
+			let low = s[b]
+			let high = s[b + 1]
+			match op {
+				case 0x4d:
+					low = ~low
+					high = ~high
+				case 0x4e:
+					low &= s[c]
+					high &= s[c + 1]
+				case 0x4f:
+					low &= ~s[c]
+					high &= ~s[c + 1]
+				case 0x50:
+					low |= s[c]
+					high |= s[c + 1]
+				case 0x51:
+					low ^= s[c]
+					high ^= s[c + 1]
+				case 0x52:
+					// bitselect: the mask's slot follows.
+					let mask = fp + code[pc]
+					pc++
+					low = (low & s[mask]) | (s[c] & ~s[mask])
+					high = (high & s[mask + 1]) | (s[c + 1] & ~s[mask + 1])
+				default:
+					// any_true
+					s[a] = (low | high) != 0 ?? (1, 0)
+					return pc
+			}
+			s[a] = low
+			s[a + 1] = high
+			return pc
+		}
+		if op == 0x5e {
+			// f32x4.demote_f64x2_zero
+			s[a] = bits32(float32(f64(s[b]))) | (bits32(float32(f64(s[b + 1]))) << 32)
+			s[a + 1] = 0
+			return pc
+		}
+		if op == 0x5f {
+			// f64x2.promote_low_f32x4
+			let low = s[b]
+			s[a] = bits64(float64(f32(low)))
+			s[a + 1] = bits64(float64(f32(low >> 32)))
+			return pc
+		}
+		if op >= 0xf8 {
+			// Between i32x4 and the float shapes: the truncations saturate.
+			unpack(s[b], s[b + 1], (op == 0xfc || op == 0xfd) ?? (64, 32), x)
+			r[2] = 0
+			r[3] = 0
+			let n = op <= 0xfb ?? (4, 2)
+			for let i = 0; i < n; i++ {
+				match op {
+					case 0xf8:
+						r[i] = saturateSigned32(float64(f32(x[i])))
+					case 0xf9:
+						r[i] = saturateUnsigned32(float64(f32(x[i])))
+					case 0xfa:
+						r[i] = bits32(float32(signedLane(x[i], 32)))
+					case 0xfb:
+						r[i] = bits32(float32(x[i]))
+					case 0xfc:
+						r[i] = saturateSigned32(f64(x[i]))
+					case 0xfd:
+						r[i] = saturateUnsigned32(f64(x[i]))
+					case 0xfe:
+						r[i] = bits64(float64(signedLane(x[i], 32)))
+					default:
+						r[i] = bits64(float64(x[i]))
+				}
+			}
+			pack(r, op >= 0xfe ?? (64, 32), s, a)
+			return pc
+		}
+		if op := 0xe0 || 0xe1 || 0xec || 0xed {
+			// abs and neg of floats clear or flip the sign bits.
+			let sign = op <= 0xe1 ?? (minInt | (1 << 31), minInt)
+			let clears = op := 0xe0 || 0xec
+			s[a] = clears ?? (s[b] & ~sign, s[b] ^ sign)
+			s[a + 1] = clears ?? (s[b + 1] & ~sign, s[b + 1] ^ sign)
+			return pc
+		}
+		if op == 0x6a {
+			// f32x4.nearest: a tie goes to the even value.
+			unpack(s[b], s[b + 1], 32, x)
+			for let i = 0; i < 4; i++ {
+				r[i] = bits32(float32(nearest(float64(f32(x[i])))))
+			}
+			pack(r, 32, s, a)
+			return pc
+		}
+		if op == 0x94 {
+			// f64x2.nearest
+			let low = bits64(nearest(f64(s[b])))
+			s[a + 1] = bits64(nearest(f64(s[b + 1])))
+			s[a] = low
+			return pc
+		}
+		if op := 0xe8 || 0xe9 {
+			// f32x4.min and max: a NaN if either lane is one, -0 below +0.
+			unpack(s[b], s[b + 1], 32, x)
+			unpack(s[c], s[c + 1], 32, y)
+			for let i = 0; i < 4; i++ {
+				let p = float64(f32(x[i]))
+				let q = float64(f32(y[i]))
+				r[i] = bits32(float32(op == 0xe8 ?? (smaller(p, q), larger(p, q))))
+			}
+			pack(r, 32, s, a)
+			return pc
+		}
+		if op := 0xf4 || 0xf5 {
+			// f64x2.min and max
+			let low = op == 0xf4 ?? (smaller(f64(s[b]), f64(s[c])), larger(f64(s[b]), f64(s[c])))
+			let high = op == 0xf4 ?? (smaller(f64(s[b + 1]), f64(s[c + 1])), larger(f64(s[b + 1]), f64(s[c + 1])))
+			s[a] = bits64(low)
+			s[a + 1] = bits64(high)
+			return pc
+		}
+		if op >= 0x7c && op <= 0x7f {
+			// extadd_pairwise: each lane is the sum of two of half its width.
+			let from = op <= 0x7d ?? (8, 16)
+			unpack(s[b], s[b + 1], from, x)
+			for let i = 0; i < 64 / from; i++ {
+				if (op & 1) == 0 {
+					r[i] = signedLane(x[2 * i], from) + signedLane(x[2 * i + 1], from)
+				} else {
+					r[i] = x[2 * i] + x[2 * i + 1]
+				}
+			}
+			pack(r, from * 2, s, a)
+			return pc
+		}
+
+		// What is left of the four integer shapes, which lay their
+		// instructions out alike in blocks of 32 opcodes from 0x60.
+		let bits = 8 << ((op - 0x60) >> 5)
+		let lanes = 128 / bits
+		let o = op & 0x1f
+		if o := 0x05 || 0x06 {
+			// narrow: the lanes of both operands, saturated to half their
+			// width.
+			unpack(s[b], s[b + 1], bits * 2, x)
+			unpack(s[c], s[c + 1], bits * 2, y)
+			let half = lanes / 2
+			for let i = 0; i < half; i++ {
+				let p = signedLane(x[i], bits * 2)
+				let q = signedLane(y[i], bits * 2)
+				r[i] = o == 5 ?? (clampSigned(p, bits), clampUnsigned(p, bits))
+				r[half + i] = o == 5 ?? (clampSigned(q, bits), clampUnsigned(q, bits))
+			}
+			pack(r, bits, s, a)
+			return pc
+		}
+		if (o >= 0x07 && o <= 0x0a) || o >= 0x1c {
+			// extend, and extmul: the low or the high half of the operands'
+			// lanes, widened, as they are or multiplied.
+			let from = bits / 2
+			let k = o >= 0x1c ?? (o - 0x1c, o - 0x07)
+			let first = (k & 1) == 1 ?? (lanes, 0)
+			unpack(s[b], s[b + 1], from, x)
+			unpack(s[c], s[c + 1], from, y) when o >= 0x1c
+			for let i = 0; i < lanes; i++ {
+				let p = k < 2 ?? (signedLane(x[first + i], from), x[first + i])
+				if o >= 0x1c {
+					let q = k < 2 ?? (signedLane(y[first + i], from), y[first + i])
+					r[i] = p * q
+				} else {
+					r[i] = p
+				}
+			}
+			pack(r, bits, s, a)
+			return pc
+		}
+		if op == 0xba {
+			// i32x4.dot_i16x8_s
+			unpack(s[b], s[b + 1], 16, x)
+			unpack(s[c], s[c + 1], 16, y)
+			for let i = 0; i < 4; i++ {
+				r[i] = signedLane(x[2 * i], 16) * signedLane(y[2 * i], 16) + signedLane(x[2 * i + 1], 16) * signedLane(y[2 * i + 1], 16)
+			}
+			pack(r, 32, s, a)
+			return pc
+		}
+		// i16x8.q15mulr_sat_s, and avgr_u of i8x16 and i16x8, which rounds up.
+		unpack(s[b], s[b + 1], bits, x)
+		unpack(s[c], s[c + 1], bits, y)
+		for let i = 0; i < lanes; i++ {
+			r[i] = op == 0x82 ?? (q15(x[i], y[i]), (x[i] + y[i] + 1) >> 1)
+		}
+		pack(r, bits, s, a)
+		return pc
+	}
+}

@@ -1,0 +1,154 @@
+internal partial module adm.interop.wasm.engine {
+	use adm.interop.wasm::*
+	// Cursor reads a range of a module's binary.
+	type Cursor {
+		data      byte[]
+		at        int
+		end       int
+		// How many numeric constants the expressions walked so far hold.
+		constants int
+		// The bytes of the last name read.
+		named     Span
+
+		def new(data byte[], at int, end int) {
+			self.data = data
+			self.at = at
+			self.end = end
+		}
+
+		def more() bool {
+			return at < end
+		}
+
+		// The next byte.
+		def u8() !int {
+			fail malformed(at, "unexpected end") when at >= end
+			at++
+			return int(data[at - 1])
+		}
+
+		// The next byte without consuming it; -1 at the end.
+		def peek() int {
+			return at < end ?? (int(data[at]), -1)
+		}
+
+		// An unsigned LEB128 integer of at most 32 bits.
+		def u32() !int {
+			let result = 0
+			let shift = 0
+			for {
+				let b = try u8()
+				if shift == 28 {
+					fail malformed(at - 1, "integer representation too long") when (b & 0x80) != 0
+					fail malformed(at - 1, "integer too large") when (b & 0x70) != 0
+				}
+				result |= (b & 0x7f) << shift
+				return result when (b & 0x80) == 0
+				shift += 7
+			}
+			return result
+		}
+
+		// A signed LEB128 integer of `bits` bits (32, 33 or 64).
+		def signed(bits int) !int {
+			let result = 0
+			let shift = 0
+			let limit = (bits + 6) / 7
+			for let n = 1;; n++ {
+				let b = try u8()
+				if n == limit {
+					fail malformed(at - 1, "integer representation too long") when (b & 0x80) != 0
+					// The bits of the last byte beyond the value's width repeat its sign.
+					let used = bits - shift
+					let spare = (b & 0x7f) >> (used - 1)
+					let full = (1 << (8 - used)) - 1
+					fail malformed(at - 1, "integer too large") unless spare == 0 || spare == full
+				}
+				result |= (b & 0x7f) << shift
+				shift += 7
+				if (b & 0x80) == 0 {
+					result |= -1 << shift when shift < 64 && (b & 0x40) != 0
+					return result
+				}
+			}
+			return result
+		}
+
+		// The next n bytes (at most 8) as a little-endian integer.
+		def fixed(n int) !int {
+			fail malformed(at, "unexpected end") when at + n > end
+			let v = 0
+			for let i = n - 1; i >= 0; i-- {
+				v = (v << 8) | int(data[at + i])
+			}
+			at += n
+			return v
+		}
+
+		// Skips n bytes.
+		def skip(n int) !none {
+			fail malformed(at, "unexpected end") when n < 0 || at + n > end
+			at += n
+			return none
+		}
+
+		// The span of the next n bytes, which are skipped.
+		def span(n int) !Span {
+			let from = at
+			try skip(n)
+			return Span{from: from, to: at}
+		}
+
+		// A name: a length and that many bytes of UTF-8.
+		def name() !string {
+			let n = try u32()
+			let s = try span(n)
+			fail malformed(s.from, "malformed UTF-8 encoding") unless utf8(data, s.from, s.to)
+			named = s
+			return string(data[s.from:s.to])
+		}
+	}
+
+	// A binary that does not follow the format.
+	def malformed(offset int, message string) ModuleError {
+		return ModuleError{message: "wasm: {message} at byte {offset}", code: "malformed", offset: offset}
+	}
+
+	// Whether data[from:to] is well-formed UTF-8: shortest forms only, no
+	// surrogates, nothing above U+10FFFF.
+	def utf8(data byte[], from int, to int) bool {
+		let i = from
+		for i < to {
+			let b = int(data[i])
+			if b < 0x80 {
+				i++
+				continue
+			}
+			let n = 0
+			let low = 0x80
+			let high = 0xbf
+			if b >= 0xc2 && b <= 0xdf {
+				n = 1
+			} else if b >= 0xe0 && b <= 0xef {
+				n = 2
+				low = 0xa0 when b == 0xe0
+				high = 0x9f when b == 0xed
+			} else if b >= 0xf0 && b <= 0xf4 {
+				n = 3
+				low = 0x90 when b == 0xf0
+				high = 0x8f when b == 0xf4
+			} else {
+				return false
+			}
+			return false when i + n >= to
+			let second = int(data[i + 1])
+			return false when second < low || second > high
+			for let k = 2; k <= n; k++ {
+				let c = int(data[i + k])
+				return false when c < 0x80 || c > 0xbf
+			}
+			i += n + 1
+		}
+		return true
+	}
+}

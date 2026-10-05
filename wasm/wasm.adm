@@ -1,0 +1,143 @@
+partial module adm.interop.wasm {
+	use adm.interop.wasm.engine::*
+
+	// One import of a module: what it asks for, and under which names.
+	struct Import {
+		moduleName string
+		name       string
+		kind       ExternKind
+	}
+
+	// One export of a module.
+	struct Export {
+		name string
+		kind ExternKind
+	}
+
+	// Module is a decoded WebAssembly module (Core 2.0, with 128-bit SIMD).
+	type Module {
+		// The decoded sections, for the engine.
+		binary  Binary
+		imports Import[]
+		exports Export[]
+
+		def new(binary Binary) {
+			self.binary = binary
+			for let (_, i) in binary.imports {
+				imports.push(Import{moduleName: i.moduleName, name: i.name, kind: i.kind})
+			}
+			for let (_, e) in binary.exports {
+				exports.push(Export{name: e.name, kind: e.kind})
+			}
+		}
+
+		// Checks the module against the validation rules: every index names
+		// something, limits and constant expressions are in order, and each
+		// function body uses its operands and labels with the right types.
+		// Fails with a ModuleError whose code is "invalid" at the first rule
+		// the module breaks.
+		def validate() !none {
+			try binary.validate()
+			return none
+		}
+	}
+
+	// Decodes a WebAssembly binary: every section, and every instruction of
+	// every function body, is checked against the binary format. The module
+	// is not validated yet: that happens when it is instantiated, or with
+	// validate().
+	// Fails with a ModuleError when the bytes are not a well-formed module.
+	def decode(bytes byte[]) !Module {
+		return new Module(try decodeBinary(bytes))
+	}
+
+	// Instance is an instantiated module.
+	type Instance {
+		// The instance as the engine holds it.
+		linked Linked
+
+		def new(linked Linked) {
+			self.linked = linked
+		}
+
+		// Calls the exported function `name`.
+		// Fails with a Trap when the code traps, and with an error when no
+		// function is exported under that name or the arguments do not
+		// match its parameters.
+		def invoke(name string, args Value[]) !Value[] {
+			return try linked.invoke(name, args)
+		}
+	}
+
+	// Store owns what instances share: the functions, tables, memories and
+	// globals modules pass to each other through imports and exports. One
+	// task uses a store at a time.
+	type Store {
+		// The engine's state.
+		machine Machine
+
+		def new() {
+			machine = new Machine()
+		}
+
+		// Makes `e` importable as `name` of the module `moduleName`.
+		def provide(moduleName string, name string, e Extern) {
+			machine.provide(moduleName, name, e)
+		}
+
+		// Makes every export of `instance` importable from the module
+		// `moduleName`.
+		def register(moduleName string, instance Instance) {
+			machine.register(moduleName, instance.linked)
+		}
+
+		// A host function of the given type, to provide.
+		def function(params ValueType[], results ValueType[], fn HostFunction) Extern {
+			return machine.function(params, results, fn)
+		}
+
+		// A global holding `value`, to provide.
+		def global(value Value, mutable bool) Extern {
+			return machine.global(value, mutable)
+		}
+
+		// The value of the global `e`.
+		def read(e Extern) Value {
+			return machine.read(e)
+		}
+
+		// A table of this type, its elements null, to provide.
+		def table(kind TableType) Extern {
+			return machine.table(kind)
+		}
+
+		// A memory of these limits, its bytes zero, to provide.
+		def memory(limits Limits) Extern {
+			return machine.memory(limits)
+		}
+
+		// Limits what the code instantiated from now on may run: each
+		// function entry and each loop iteration takes one unit, and code
+		// that has none left stops with a Trap ("exhausted").
+		def fuel(units int) {
+			machine.metered = true
+			machine.fuel = units
+		}
+
+		// The fuel left.
+		def fuel() int {
+			return machine.fuel
+		}
+
+		// Instantiates a module: validates it, binds its imports to what
+		// the store provides, compiles its functions, fills its tables and
+		// memories from the active segments and runs its start function.
+		// Fails with a ModuleError when the module is invalid ("invalid")
+		// or an import is missing or of another type ("unlinkable"), and
+		// with a Trap when a segment does not fit or the start function
+		// traps; what the module wrote before the trap stays written.
+		def instantiate(m Module) !Instance {
+			return new Instance(try machine.instantiate(m.binary))
+		}
+	}
+}

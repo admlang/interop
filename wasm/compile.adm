@@ -1,0 +1,1521 @@
+internal partial module adm.interop.wasm.engine {
+	use adm.interop.wasm::*
+	// One open block of the function being compiled.
+	struct Frame {
+		// The opcode that opened it: block, loop, if or else; 0 for the
+		// function's own body.
+		op        int
+		params    int[]
+		results   int[]
+		// The height of the operand stack where the block starts.
+		height    int
+		// Set once an instruction never continues (br, return, unreachable):
+		// the rest of the block cannot run, and its operands have any type.
+		dead      bool
+		// The block sits in code that cannot run: nothing is emitted for it.
+		silent    bool
+		// The frame slot of its first parameter, which is that of its first
+		// result too.
+		base      int
+		// A loop: where its code starts.
+		start     int
+		// The branches to its end, to patch when the end is known.
+		chain     int
+		// An if: the branch that skips its first arm.
+		otherwise int
+	}
+
+	// Compiler checks a decoded module against the validation rules of
+	// WebAssembly 2.0 (index spaces, limits, constant expressions, the
+	// operand and control stacks of every function body) and, in the same
+	// pass, turns each body into the register instructions the machine runs.
+	//
+	// A function's frame is its parameters and locals, then the constants
+	// its code uses, then one slot per operand stack position (two for a
+	// v128). An operand lives where it already is while that is safe: a
+	// local.get or a constant emits nothing, the instruction that uses the
+	// operand reads the local's or the constant's slot.
+	type Compiler {
+		m               Binary
+		// The parameters and results of each function type, as codes.
+		typeParams      int[][]
+		typeResults     int[][]
+		// The type index of each function, imports first.
+		functions       int[]
+		tables          TableType[]
+		memories        int
+		globals         GlobalType[]
+		importedGlobals int
+		// The functions ref.func may name: those an element segment, a
+		// global's initializer or an export mentions.
+		declared        bool[]
+		// The result lists of the block types that name one value type.
+		singles         int[][]
+		nothing         int[]
+
+		// Where the module's objects are in the store; set by the store
+		// before run() when code is wanted (emitting).
+		emitting    bool
+		// Charge fuel at function entries and loop heads.
+		metered     bool
+		out         int[]
+		pool        int[]
+		// The entry of each function of the store.
+		entries     int[]
+		funcIds     int[]
+		typeIds     int[]
+		tableIds    int[]
+		globalSlots int[]
+		memoryId    int
+		dataBase    int
+		elemBase    int
+		// The calls emitted, to bind to their entries once all are known.
+		callSites   int[]
+
+		// The function being compiled. vals holds the type of each operand,
+		// places where it is and its own slot (place | home << 16).
+		vals         int[]
+		places       int[]
+		frames       Frame[]
+		localParams  int[]
+		paramSlots   int[]
+		body         Body
+		// For each run of locals, the index after its last local, and the
+		// slot of its first.
+		localEnds    int[]
+		runSlots     int[]
+		localSlots   int
+		// The slot of the local that local() last looked up.
+		localAt      int
+		// How many operands on the stack still read each local's slot.
+		pending      int[]
+		// Operands below this stack index are not read from locals.
+		flushed      int
+		consts       int[]
+		constLimit   int
+		// The next free operand slot, and the highest it reached.
+		top          int
+		maxTop       int
+		live         bool
+		aborted      bool
+		// Where the operand last popped was.
+		lastLoc      int
+		// The last instruction that wrote a result: its index, its slot,
+		// how many words it has, and the end of the copies that follow it.
+		lastAt       int
+		lastSlot     int
+		lastWords    int
+		lastTail     int
+		blockParams  int[]
+		blockResults int[]
+		targets      int[]
+		kept         int[]
+		offset       int
+		first        int
+		second       int
+		third        int
+
+		def new(m Binary) {
+			self.m = m
+			for let code = codeI32; code <= codeExternRef; code++ {
+				singles.push(int[code])
+			}
+			for let (_, t) in m.types {
+				let params int[]
+				for let (_, p) in t.params {
+					params.push(p.value)
+				}
+				let results int[]
+				for let (_, r) in t.results {
+					results.push(r.value)
+				}
+				typeParams.push(params)
+				typeResults.push(results)
+			}
+			body = Body{}
+			memoryId = -1
+			lastAt = -1
+			lastTail = -1
+		}
+
+		// Validates the whole module, and compiles it when emitting.
+		def run() !none {
+			try verify()
+			try compile()
+			return none
+		}
+
+		// Validates everything but the function bodies.
+		def verify() !none {
+			for let (i, entry) in m.imports {
+				match entry.kind {
+					case ExternKind.Function:
+						fail invalid(-1, "unknown type {entry.typeIndex} in import {i}") when entry.typeIndex >= m.types.len()
+						functions.push(entry.typeIndex)
+					case ExternKind.Table:
+						try tableLimits(entry.table.limits)
+						tables.push(entry.table)
+					case ExternKind.Memory:
+						try memoryLimits(entry.memory)
+						memories++
+					case ExternKind.Global:
+						globals.push(entry.global)
+				}
+			}
+			importedGlobals = globals.len()
+			let importedFunctions = functions.len()
+			for let (i, t) in m.functions {
+				fail invalid(-1, "unknown type {t} in function {importedFunctions + i}") when t >= m.types.len()
+				functions.push(t)
+			}
+			for let (_, t) in m.tables {
+				try tableLimits(t.limits)
+				tables.push(t)
+			}
+			for let (_, limits) in m.memories {
+				try memoryLimits(limits)
+				memories++
+			}
+			fail invalid(-1, "multiple memories") when memories > 1
+			for let i = 0; i < functions.len(); i++ {
+				declared.push(false)
+			}
+			// A constant expression sees the imported globals only.
+			for let (_, g) in m.globals {
+				try constant(g.init, g.kind.content.value)
+			}
+			for let (_, g) in m.globals {
+				globals.push(g.kind)
+			}
+			let names map<string, bool>
+			for let (_, e) in m.exports {
+				// Compared as bytes: a name may contain U+0000.
+				let key = m.bytes[e.bytes.from:e.bytes.to].hex()
+				fail invalid(-1, "duplicate export name \"{e.name}\"") when names.hasKey(key)
+				names[key] = true
+				match e.kind {
+					case ExternKind.Function:
+						fail invalid(-1, "unknown function {e.index} in export \"{e.name}\"") when e.index >= functions.len()
+						declared[e.index] = true
+					case ExternKind.Table:
+						fail invalid(-1, "unknown table {e.index} in export \"{e.name}\"") when e.index >= tables.len()
+					case ExternKind.Memory:
+						fail invalid(-1, "unknown memory {e.index} in export \"{e.name}\"") when e.index >= memories
+					case ExternKind.Global:
+						fail invalid(-1, "unknown global {e.index} in export \"{e.name}\"") when e.index >= globals.len()
+				}
+			}
+			if m.hasStart {
+				fail invalid(-1, "unknown function {m.start}: the start function") when m.start >= functions.len()
+				let t = functions[m.start]
+				fail invalid(-1, "start function must take and return nothing") unless typeParams[t].len() == 0 && typeResults[t].len() == 0
+			}
+			for let (i, e) in m.elements {
+				if e.mode == SegmentMode.Active {
+					fail invalid(-1, "unknown table {e.table} in element segment {i}") when e.table >= tables.len()
+					fail invalid(-1, "type mismatch: element segment {i} and its table hold different references") unless tables[e.table].element == e.kind
+					try constant(e.offset, codeI32)
+				}
+				for let (_, f) in e.functions {
+					fail invalid(-1, "unknown function {f} in element segment {i}") when f >= functions.len()
+					declared[f] = true
+				}
+				for let (_, x) in e.expressions {
+					try constant(x, e.kind.value)
+				}
+			}
+			for let (i, d) in m.datas {
+				continue unless d.mode == SegmentMode.Active
+				fail invalid(-1, "unknown memory {d.memory} in data segment {i}") when d.memory >= memories
+				try constant(d.offset, codeI32)
+			}
+			return none
+		}
+
+		// Validates the function bodies, and compiles them when emitting.
+		def compile() !none {
+			let imported = functions.len() - m.bodies.len()
+			for let (i, b) in m.bodies {
+				try function(imported + i, b)
+			}
+			fail invalid(-1, "the module's code is too large") when out.len() > 0x1fffffff
+			// A call to a function of this or of another module jumps to its
+			// entry; one to a host function keeps going through the store.
+			for let (_, site) in callSites {
+				let w = out[site]
+				let entry = entries[(w >> 32) & 0xffffffff]
+				out[site] = opCall | (w & 0xffff0000) | entry << 32 when entry >= 0
+			}
+			return none
+		}
+
+		def tableLimits(limits Limits) !none {
+			fail invalid(-1, "size minimum must not be greater than maximum") when limits.bounded && limits.min > limits.max
+			return none
+		}
+
+		def memoryLimits(limits Limits) !none {
+			fail invalid(-1, "memory size must be at most 65536 pages (4GiB)") when limits.min > 65536 || (limits.bounded && limits.max > 65536)
+			fail invalid(-1, "size minimum must not be greater than maximum") when limits.bounded && limits.min > limits.max
+			return none
+		}
+
+		// Checks that a constant expression gives one value of type `want`.
+		def constant(span Span, want int) !none {
+			let c = new Cursor(m.bytes, span.from, span.to)
+			let count = 0
+			let got = codeAny
+			for {
+				let at = c.at
+				let op = try c.u8()
+				match op {
+					case 0x41:
+						try c.signed(32)
+						got = codeI32
+					case 0x42:
+						try c.signed(64)
+						got = codeI64
+					case 0x43:
+						try c.skip(4)
+						got = codeF32
+					case 0x44:
+						try c.skip(8)
+						got = codeF64
+					case 0xfd:
+						fail invalid(at, "constant expression required") unless try c.u32() == 0x0c
+						try c.skip(16)
+						got = codeV128
+					case 0xd0:
+						let t = try referenceType(c)
+						got = t.value
+					case 0xd2:
+						let x = try c.u32()
+						fail invalid(at, "unknown function {x}") when x >= functions.len()
+						declared[x] = true
+						got = codeFuncRef
+					case 0x23:
+						let x = try c.u32()
+						fail invalid(at, "unknown global {x}") when x >= importedGlobals
+						fail invalid(at, "constant expression required: global {x} is mutable") when globals[x].mutable
+						got = globals[x].content.value
+					case 0x0b:
+						fail invalid(at, "type mismatch: a constant expression gives one value") unless count == 1
+						fail invalid(at, "type mismatch: expected {typeName(want)}, found {typeName(got)}") unless got == want
+						return none
+					default:
+						fail invalid(at, "constant expression required")
+				}
+				count++
+			}
+			return none
+		}
+
+		// Validates and compiles the body of function `index`.
+		def function(index int, code Body) !none {
+			let kind = functions[index]
+			body = code
+			localParams = typeParams[kind]
+			// The slots of the parameters and of the runs of locals. A
+			// frame addresses 65536 slots: a function that needs more is
+			// valid, and traps when it is called.
+			paramSlots.len(0)
+			let slots = 0
+			for let (_, p) in localParams {
+				paramSlots.push(slots)
+				slots += slotsOf(p)
+			}
+			let params = slots
+			localEnds.len(0)
+			runSlots.len(0)
+			let total = 0
+			for let (_, run) in code.locals {
+				total += run.count
+				localEnds.push(total)
+				runSlots.push(slots)
+				slots += run.count * slotsOf(run.kind.value) when slots < 0x10000
+			}
+			let results = typeResults[kind]
+			constLimit = code.constants.min(32)
+			aborted = !emitting || slots + constLimit + 2 > 0xffff
+			localSlots = aborted ?? (0, slots)
+			pending.len(0)
+			for let i = 0; i < localSlots; i++ {
+				pending.push(0)
+			}
+			consts.len(0)
+			top = localSlots + constLimit
+			maxTop = top
+			flushed = 0
+			lastAt = -1
+			lastTail = -1
+			vals.len(0)
+			places.len(0)
+			frames.len(0)
+			let start = out.len()
+			if emitting {
+				entries[funcIds[index]] = start
+				out.push(opEnter, 0, 0)
+				out.push(opFuel | 1 << 16) when metered
+			}
+			enter(0, nothing, results)
+			let c = new Cursor(m.bytes, code.code.from, code.code.to)
+			for frames.len() > 0 {
+				try instruction(c)
+			}
+			return none unless emitting
+			if aborted {
+				out.len(start)
+				out.push(opTrap | 1 << 16)
+				return none
+			}
+			let frame = maxTop
+			for let (_, r) in results {
+				frame -= slotsOf(r)
+			}
+			// The results come back in the first slots of the frame.
+			let resultSlots = maxTop - frame
+			frame = maxTop.max(resultSlots)
+			out[start] = opEnter | frame << 16 | params << 32 | localSlots << 48
+			out[start + 1] = consts.len() | pool.len() << 8
+			out[start + 2] = memoryId + 1
+			for let (_, v) in consts {
+				pool.push(v)
+			}
+			return none
+		}
+
+		// The type of local x: the parameters come first, then the runs.
+		// localAt is its slot.
+		def local(at int, x int) !int {
+			if x < localParams.len() {
+				localAt = paramSlots[x]
+				return localParams[x]
+			}
+			let i = x - localParams.len()
+			fail invalid(at, "unknown local {x}") when i >= body.localCount
+			let low = 0
+			let high = localEnds.len() - 1
+			for low < high {
+				let middle = (low + high) / 2
+				if localEnds[middle] > i {
+					high = middle
+				} else {
+					low = middle + 1
+				}
+			}
+			let t = body.locals[low].kind.value
+			let before = low == 0 ?? (0, localEnds[(low - 1).max(0)])
+			localAt = runSlots[low] + (i - before) * slotsOf(t)
+			return t
+		}
+
+		def slotsOf(t int) int {
+			return t == codeV128 ?? (2, 1)
+		}
+
+		// Stops emitting for this function: it does not fit a frame.
+		def abort() {
+			aborted = true
+			live = false
+			localSlots = 0
+		}
+
+		def refresh() {
+			let f = frames[frames.len() - 1]
+			live = !aborted && !f.dead && !f.silent
+		}
+
+		// Pushes an operand of type t in its own slot.
+		def push(t int) {
+			vals.push(t)
+			places.push(top | top << 16)
+			top += slotsOf(t)
+			if top > maxTop {
+				maxTop = top
+				abort() when top > 0xffff
+			}
+		}
+
+		// Pushes an operand that stays in the slot `place`: a local's or a
+		// constant's.
+		def pushAt(t int, place int) {
+			vals.push(t)
+			places.push(place | top << 16)
+			pending[place]++ when place < localSlots
+			top += slotsOf(t)
+			if top > maxTop {
+				maxTop = top
+				abort() when top > 0xffff
+			}
+		}
+
+		// Pushes a constant: it lives in a constant slot of the frame while
+		// there is room, else an instruction loads it.
+		def pushConst(t int, bits int) {
+			if !live {
+				push(t)
+				return
+			}
+			for let i = 0; i < consts.len(); i++ {
+				if consts[i] == bits {
+					pushAt(t, localSlots + i)
+					return
+				}
+			}
+			if consts.len() < constLimit {
+				consts.push(bits)
+				pushAt(t, localSlots + consts.len() - 1)
+				return
+			}
+			let dst = top
+			push(t)
+			define(opConst, dst, 0, 0)
+			word(bits)
+		}
+
+		// Removes the top operand, whatever its type.
+		def discard() {
+			let p = places.pop()
+			let place = p & 0xffff
+			pending[place]-- when place < localSlots
+			top = p >> 16
+			lastLoc = place
+			vals.pop()
+			flushed = vals.len() when flushed > vals.len()
+		}
+
+		def enter(op int, params int[], results int[]) {
+			let silent = aborted
+			if frames.len() > 0 {
+				let parent = frames[frames.len() - 1]
+				silent = aborted || parent.dead || parent.silent
+			}
+			frames.push(Frame{op: op, params: params, results: results, height: vals.len(), silent: silent, base: top})
+			pushAll(params)
+			refresh()
+		}
+
+		// Closes the innermost block: its results are on the stack and
+		// nothing else is.
+		def leave(at int) !Frame {
+			let f = frames[frames.len() - 1]
+			try popAll(at, f.results)
+			fail invalid(at, "type mismatch: values remain on the stack at the end of a block") unless vals.len() == f.height
+			frames.pop()
+			refresh() when frames.len() > 0
+			return f
+		}
+
+		// Marks the rest of the innermost block as unreachable.
+		def unreachable() {
+			let f = frames[frames.len() - 1]
+			for vals.len() > f.height {
+				discard()
+			}
+			f.dead = true
+			live = false
+		}
+
+		def pop(at int) !int {
+			let f = frames[frames.len() - 1]
+			if vals.len() == f.height {
+				lastLoc = 0
+				return codeAny when f.dead
+				fail invalid(at, "type mismatch: the stack is empty")
+			}
+			let t = vals[vals.len() - 1]
+			discard()
+			return t
+		}
+
+		// Pops a value of type `want`; returns what was there.
+		def expect(at int, want int) !int {
+			let got = try pop(at)
+			fail invalid(at, "type mismatch: expected {typeName(want)}, found {typeName(got)}") unless got == want || got == codeAny || want == codeAny
+			return got
+		}
+
+		def popAll(at int, types int[]) !none {
+			for let i = types.len() - 1; i >= 0; i-- {
+				try expect(at, types[i])
+			}
+			return none
+		}
+
+		def pushAll(types int[]) {
+			for let i = 0; i < types.len(); i++ {
+				push(types[i])
+			}
+		}
+
+		// Checks that the top operands of reachable code have these types,
+		// leaving them where they are.
+		def peek(at int, types int[]) !none {
+			let f = frames[frames.len() - 1]
+			let n = types.len()
+			fail invalid(at, "type mismatch: the stack is empty") when vals.len() - f.height < n
+			for let i = 0; i < n; i++ {
+				let got = vals[vals.len() - n + i]
+				fail invalid(at, "type mismatch: expected {typeName(types[i])}, found {typeName(got)}") unless got == types[i]
+			}
+			return none
+		}
+
+		// The frame a branch to the label `depth` blocks out goes to.
+		def target(at int, depth int) !Frame {
+			fail invalid(at, "unknown label {depth}") when depth >= frames.len()
+			return frames[frames.len() - 1 - depth]
+		}
+
+		// What a branch to f carries: a loop's parameters, since the branch
+		// restarts it, else the block's results.
+		def carried(f Frame) int[] {
+			return f.op == 0x03 ?? (f.params, f.results)
+		}
+
+		// Reads a block type into blockParams and blockResults.
+		def blockType(c Cursor, at int) !none {
+			let b = c.peek()
+			blockParams = nothing
+			if b == 0x40 {
+				c.at++
+				blockResults = nothing
+				return none
+			}
+			if b >= 0x6f && b <= 0x7f {
+				let t = try valueType(c)
+				blockResults = singles[t.value]
+				return none
+			}
+			let x = try c.signed(33)
+			fail invalid(at, "unknown type {x}") when x >= typeParams.len()
+			blockParams = typeParams[x]
+			blockResults = typeResults[x]
+			return none
+		}
+
+		def needMemory(at int) !none {
+			fail invalid(at, "unknown memory 0") when memories == 0
+			return none
+		}
+
+		def table(at int, x int) !TableType {
+			fail invalid(at, "unknown table {x}") when x >= tables.len()
+			return tables[x]
+		}
+
+		def word(w int) {
+			out.push(w)
+		}
+
+		def emit(op int, a int, b int, c int) {
+			out.push(op | a << 16 | b << 32 | c << 48)
+		}
+
+		// Emits an instruction whose first operand is the slot it writes.
+		// The words that follow it are added with more().
+		def define(op int, dst int, a int, b int) {
+			lastAt = out.len()
+			lastSlot = dst
+			lastWords = 1
+			out.push(op | dst << 16 | a << 32 | b << 48)
+			lastTail = out.len()
+		}
+
+		// A further word of the instruction define() emitted.
+		def more(w int) {
+			out.push(w)
+			lastWords++
+			lastTail = out.len()
+		}
+
+		// A place code may be reached from elsewhere: what precedes it can
+		// no longer be rewritten.
+		def mark() {
+			lastAt = -1
+			lastTail = -1
+		}
+
+		// Copies operand i to its own slot when it is elsewhere.
+		def materialize(i int) {
+			let p = places[i]
+			let place = p & 0xffff
+			let home = p >> 16
+			return when place == home
+			pending[place]-- when place < localSlots
+			places[i] = home | home << 16
+			let following = lastTail == out.len()
+			out.push((vals[i] == codeV128 ?? (opCopy2, opCopy)) | home << 16 | place << 32)
+			if home == lastSlot {
+				mark()
+			} else if following {
+				lastTail = out.len()
+			}
+		}
+
+		// Copies the top n operands to their own slots.
+		def materializeTop(n int) {
+			for let i = vals.len() - n; i < vals.len(); i++ {
+				materialize(i)
+			}
+		}
+
+		// Copies every operand that reads a local to its own slot: needed
+		// before the local is written, and where control flow can join.
+		def flush() {
+			for let i = flushed; i < vals.len(); i++ {
+				materialize(i) when (places[i] & 0xffff) < localSlots
+			}
+			flushed = vals.len()
+		}
+
+		// A link of a chain of branch targets to patch: the word at
+		// `index`, whose target is the whole word (0), from bit 16 (1) or
+		// from bit 32 (2). Until it is patched the target holds the next link.
+		def link(index int, kind int) int {
+			return (index << 2 | kind) + 1
+		}
+
+		def patch(chain int, to int) {
+			let at = chain
+			for at != 0 {
+				let index = (at - 1) >> 2
+				let w = out[index]
+				match (at - 1) & 3 {
+					case 0:
+						at = w
+						out[index] = to
+					case 1:
+						at = w >> 16
+						out[index] = (w & 0xffff) | to << 16
+					default:
+						at = (w >> 32) & 0xffffffff
+						out[index] = (w & 0xffffffff) | to << 32
+				}
+			}
+		}
+
+		// Whether the condition in slot `cond` is the comparison just
+		// emitted, so that it can become a branch.
+		def comparison(cond int) bool {
+			return false unless lastAt >= 0 && lastTail == out.len() && lastSlot == cond && lastWords == 1
+			let op = out[lastAt] & 0xffff
+			return op >= 0x45 && op <= 0x5a
+		}
+
+		// Takes the comparison back out of the code; the copies emitted
+		// after it move down.
+		def take() int {
+			let w = out[lastAt]
+			for let i = lastAt; i < out.len() - 1; i++ {
+				out[i] = out[i + 1]
+			}
+			out.pop()
+			mark()
+			return w
+		}
+
+		// Emits a jump to f's label.
+		def jump(f Frame) {
+			if f.op == 0x03 {
+				out.push(opJump | f.start << 16)
+				return
+			}
+			out.push(opJump | f.chain << 16)
+			f.chain = link(out.len() - 1, 1)
+		}
+
+		// Emits a branch to f's label taken when the condition in slot
+		// `cond` holds (or, with `unless`, when it does not). Returns the
+		// link of its target when f is nil-like: see branchOver.
+		def branch(cond int, f Frame, base int) {
+			if comparison(cond) {
+				let w = take()
+				out.push((base + (w & 0xffff) - 0x45) | ((w >> 32) & 0xffff) << 16 | ((w >> 48) & 0xffff) << 32)
+				if f.op == 0x03 {
+					out.push(f.start)
+					return
+				}
+				out.push(f.chain)
+				f.chain = link(out.len() - 1, 0)
+				return
+			}
+			let op = base == opBranchTrue ?? (opBrIf, opBrIfNot)
+			if f.op == 0x03 {
+				out.push(op | cond << 16 | f.start << 32)
+				return
+			}
+			out.push(op | cond << 16 | f.chain << 32)
+			f.chain = link(out.len() - 1, 2)
+		}
+
+		// Emits a branch taken when the condition does not hold, to a place
+		// not known yet; returns the link to patch.
+		def branchOver(cond int) int {
+			if comparison(cond) {
+				let w = take()
+				out.push((opBranchFalse + (w & 0xffff) - 0x45) | ((w >> 32) & 0xffff) << 16 | ((w >> 48) & 0xffff) << 32)
+				out.push(0)
+				return link(out.len() - 1, 0)
+			}
+			out.push(opBrIfNot | cond << 16)
+			return link(out.len() - 1, 2)
+		}
+
+		// Whether the top n operands are where f's label wants them.
+		def inPlace(f Frame, n int) bool {
+			let dst = f.base
+			for let i = vals.len() - n; i < vals.len(); i++ {
+				return false unless (places[i] & 0xffff) == dst
+				dst += slotsOf(vals[i])
+			}
+			return true
+		}
+
+		// Moves the top n operands to the slots f's label wants. The label
+		// is at or below them, so going up never overwrites one to come.
+		def moveTo(f Frame, n int) {
+			let dst = f.base
+			for let i = vals.len() - n; i < vals.len(); i++ {
+				let place = places[i] & 0xffff
+				out.push((vals[i] == codeV128 ?? (opCopy2, opCopy)) | dst << 16 | place << 32) unless place == dst
+				dst += slotsOf(vals[i])
+			}
+		}
+
+		// Returns the top n operands, which are in their own slots: they
+		// move to the start of the frame.
+		def returnHomes(n int) {
+			let dst = 0
+			for let i = vals.len() - n; i < vals.len(); i++ {
+				let place = places[i] & 0xffff
+				out.push((vals[i] == codeV128 ?? (opCopy2, opCopy)) | dst << 16 | place << 32) unless place == dst
+				dst += slotsOf(vals[i])
+			}
+			out.push(opRet)
+		}
+
+		// Returns the top n operands.
+		def returnTop(n int) {
+			if n == 1 {
+				// One value cannot be overwritten on its way.
+				let i = vals.len() - 1
+				let place = places[i] & 0xffff
+				out.push((vals[i] == codeV128 ?? (opCopy2, opCopy)) | place << 32) unless place == 0
+				out.push(opRet)
+				return
+			}
+			materializeTop(n)
+			returnHomes(n)
+		}
+
+		// Emits what goes to f's label with the top n operands, which are
+		// in their own slots when f is the function.
+		def leaveTo(f Frame, n int) {
+			if f.op == 0 {
+				returnHomes(n)
+				return
+			}
+			moveTo(f, n)
+			jump(f)
+		}
+
+		// One value of type `from` becomes one of type `to` through `op`.
+		def unary(at int, op int, from int, to int) !none {
+			try expect(at, from)
+			let a = lastLoc
+			let dst = top
+			push(to)
+			define(op, dst, a, 0) when live
+			return none
+		}
+
+		// Two values of type `t` become one of type `to` through `op`.
+		def binary(at int, op int, t int, to int) !none {
+			try expect(at, t)
+			let b = lastLoc
+			try expect(at, t)
+			let a = lastLoc
+			let dst = top
+			push(to)
+			define(op, dst, a, b) when live
+			return none
+		}
+
+		// Pops the three i32 operands of a bulk instruction into first,
+		// second and third.
+		def three(at int) !none {
+			try expect(at, codeI32)
+			third = lastLoc
+			try expect(at, codeI32)
+			second = lastLoc
+			try expect(at, codeI32)
+			first = lastLoc
+			return none
+		}
+
+		// Stores the top operand in the local at `slot`.
+		def store(slot int, t int, value int) {
+			flush() when pending[slot] > 0
+			// The instruction that just computed the value writes the local.
+			if lastAt >= 0 && lastAt + lastWords == out.len() && lastSlot == value && value >= localSlots {
+				out[lastAt] = (out[lastAt] & ~0xffff0000) | slot << 16
+				mark()
+				return
+			}
+			out.push((t == codeV128 ?? (opCopy2, opCopy)) | slot << 16 | value << 32) unless slot == value
+		}
+
+		def instruction(c Cursor) !none {
+			let at = c.at
+			let op = try c.u8()
+			match op {
+				case 0x00:
+					out.push(opTrap) when live
+					unreachable()
+				case 0x01:
+				case 0x02, 0x03:
+					try blockType(c, at)
+					if live {
+						try peek(at, blockParams)
+						flush()
+						materializeTop(blockParams.len())
+					}
+					try popAll(at, blockParams)
+					enter(op, blockParams, blockResults)
+					if op == 0x03 && live {
+						let f = frames[frames.len() - 1]
+						f.start = out.len()
+						mark()
+						out.push(opFuel | 1 << 16) when metered
+					}
+				case 0x04:
+					try blockType(c, at)
+					try expect(at, codeI32)
+					let cond = lastLoc
+					if live {
+						try peek(at, blockParams)
+						flush()
+						materializeTop(blockParams.len())
+					}
+					try popAll(at, blockParams)
+					enter(op, blockParams, blockResults)
+					if live {
+						let f = frames[frames.len() - 1]
+						f.otherwise = branchOver(cond)
+					}
+				case 0x05:
+					let f = frames[frames.len() - 1]
+					fail invalid(at, "else without if") unless f.op == 0x04
+					if live {
+						try peek(at, f.results)
+						materializeTop(f.results.len())
+						jump(f)
+					}
+					try leave(at)
+					patch(f.otherwise, out.len())
+					mark()
+					enter(0x05, f.params, f.results)
+					let g = frames[frames.len() - 1]
+					g.chain = f.chain
+				case 0x0b:
+					let f = frames[frames.len() - 1]
+					if live {
+						try peek(at, f.results)
+						if f.op == 0 {
+							returnTop(f.results.len())
+						} else {
+							materializeTop(f.results.len())
+						}
+					}
+					try leave(at)
+					// Without an else, the if passes its parameters through.
+					fail invalid(at, "type mismatch: an if without else must give what it takes") when f.op == 0x04 && !sameTypes(f.params, f.results)
+					patch(f.otherwise, out.len()) when f.op == 0x04
+					patch(f.chain, out.len())
+					mark()
+					pushAll(f.results) when frames.len() > 0
+				case 0x0c:
+					let depth = try c.u32()
+					let f = try target(at, depth)
+					let types = carried(f)
+					if live {
+						try peek(at, types)
+						if f.op == 0 {
+							returnTop(types.len())
+						} else {
+							moveTo(f, types.len())
+							jump(f)
+						}
+					}
+					try popAll(at, types)
+					unreachable()
+				case 0x0d:
+					let depth = try c.u32()
+					let f = try target(at, depth)
+					let types = carried(f)
+					try expect(at, codeI32)
+					let cond = lastLoc
+					if live {
+						try peek(at, types)
+						if f.op != 0 && inPlace(f, types.len()) {
+							branch(cond, f, opBranchTrue)
+						} else {
+							// The values move only when the branch is taken.
+							materializeTop(types.len())
+							let over = branchOver(cond)
+							leaveTo(f, types.len())
+							patch(over, out.len())
+							mark()
+						}
+					} else {
+						try popAll(at, types)
+						pushAll(types)
+					}
+				case 0x0e:
+					try branchTable(c, at)
+				case 0x0f:
+					let types = frames[0].results
+					if live {
+						try peek(at, types)
+						returnTop(types.len())
+					}
+					try popAll(at, types)
+					unreachable()
+				case 0x10:
+					let x = try c.u32()
+					fail invalid(at, "unknown function {x}") when x >= functions.len()
+					let params = typeParams[functions[x]]
+					if live {
+						try peek(at, params)
+						materializeTop(params.len())
+					}
+					try popAll(at, params)
+					let base = top
+					pushAll(typeResults[functions[x]])
+					if live {
+						callSites.push(out.len())
+						out.push(opCallFn | base << 16 | funcIds[x] << 32)
+					}
+				case 0x11:
+					let t = try c.u32()
+					let x = try c.u32()
+					let through = try table(at, x)
+					fail invalid(at, "type mismatch: call_indirect needs a table of functions") unless through.element == ValueType.FuncRef
+					fail invalid(at, "unknown type {t}") when t >= typeParams.len()
+					try expect(at, codeI32)
+					let index = lastLoc
+					if live {
+						try peek(at, typeParams[t])
+						materializeTop(typeParams[t].len())
+					}
+					try popAll(at, typeParams[t])
+					let base = top
+					pushAll(typeResults[t])
+					if live {
+						out.push(opCallIndirect | base << 16 | index << 32)
+						out.push(tableIds[x] | typeIds[t] << 32)
+					}
+				case 0x1a:
+					try pop(at)
+				case 0x1b:
+					// Without a type, select chooses between numbers or vectors.
+					try expect(at, codeI32)
+					let cond = lastLoc
+					let b = try pop(at)
+					let right = lastLoc
+					let a = try pop(at)
+					let left = lastLoc
+					fail invalid(at, "type mismatch: select without a type cannot choose between references") when a > codeV128 || b > codeV128
+					fail invalid(at, "type mismatch: select between {typeName(a)} and {typeName(b)}") unless a == b || a == codeAny || b == codeAny
+					let t = a == codeAny ?? (b, a)
+					let dst = top
+					push(t)
+					if live {
+						define(t == codeV128 ?? (opSelect2, 0x1b), dst, left, right)
+						more(cond)
+					}
+				case 0x1c:
+					let n = try c.u32()
+					fail invalid(at, "invalid result arity") unless n == 1
+					let kind = try valueType(c)
+					let t = kind.value
+					try expect(at, codeI32)
+					let cond = lastLoc
+					try expect(at, t)
+					let right = lastLoc
+					try expect(at, t)
+					let left = lastLoc
+					let dst = top
+					push(t)
+					if live {
+						define(t == codeV128 ?? (opSelect2, 0x1b), dst, left, right)
+						more(cond)
+					}
+				case 0x20:
+					let x = try c.u32()
+					let t = try local(at, x)
+					if live {
+						pushAt(t, localAt)
+					} else {
+						push(t)
+					}
+				case 0x21:
+					let x = try c.u32()
+					let t = try local(at, x)
+					try expect(at, t)
+					store(localAt, t, lastLoc) when live
+				case 0x22:
+					let x = try c.u32()
+					let t = try local(at, x)
+					try expect(at, t)
+					if live {
+						store(localAt, t, lastLoc)
+						pushAt(t, localAt)
+					} else {
+						push(t)
+					}
+				case 0x23:
+					let x = try c.u32()
+					fail invalid(at, "unknown global {x}") when x >= globals.len()
+					let t = globals[x].content.value
+					let dst = top
+					push(t)
+					if live {
+						define(t == codeV128 ?? (opGlobalGet2, 0x23), dst, 0, 0)
+						out[lastAt] |= globalSlots[x] << 32
+					}
+				case 0x24:
+					let x = try c.u32()
+					fail invalid(at, "unknown global {x}") when x >= globals.len()
+					fail invalid(at, "global is immutable: {x}") unless globals[x].mutable
+					let t = globals[x].content.value
+					try expect(at, t)
+					out.push((t == codeV128 ?? (opGlobalSet2, 0x24)) | lastLoc << 16 | globalSlots[x] << 32) when live
+				case 0x25:
+					let x = try c.u32()
+					let from = try table(at, x)
+					try unary(at, 0x25, codeI32, from.element.value)
+					more(tableIds[x]) when live
+				case 0x26:
+					let x = try c.u32()
+					let into = try table(at, x)
+					try expect(at, into.element.value)
+					let value = lastLoc
+					try expect(at, codeI32)
+					if live {
+						emit(0x26, lastLoc, value, 0)
+						word(tableIds[x])
+					}
+				case 0x3f:
+					try c.skip(1)
+					try needMemory(at)
+					let dst = top
+					push(codeI32)
+					define(0x3f, dst, 0, 0) when live
+				case 0x40:
+					try c.skip(1)
+					try needMemory(at)
+					try unary(at, 0x40, codeI32, codeI32)
+				case 0x41:
+					pushConst(codeI32, try c.signed(32))
+				case 0x42:
+					pushConst(codeI64, try c.signed(64))
+				case 0x43:
+					pushConst(codeF32, try c.fixed(4))
+				case 0x44:
+					pushConst(codeF64, try c.fixed(8))
+				case 0xd0:
+					let t = try referenceType(c)
+					pushConst(t.value, 0)
+				case 0xd1:
+					let t = try pop(at)
+					let a = lastLoc
+					fail invalid(at, "type mismatch: ref.is_null of {typeName(t)}") unless t := codeAny || codeFuncRef || codeExternRef
+					let dst = top
+					push(codeI32)
+					define(0xd1, dst, a, 0) when live
+				case 0xd2:
+					let x = try c.u32()
+					fail invalid(at, "unknown function {x}") when x >= functions.len()
+					fail invalid(at, "undeclared function reference: {x}") unless declared[x]
+					// A reference is the function's number in the store, plus one.
+					if live {
+						pushConst(codeFuncRef, funcIds[x] + 1)
+					} else {
+						push(codeFuncRef)
+					}
+				case 0xfc:
+					try prefixed(c, at)
+				case 0xfd:
+					try vector(c, at)
+				default:
+					if op >= 0x28 && op <= 0x3e {
+						try access(c, at, op)
+					} else if op >= 0x45 && op <= 0xc4 {
+						try numeric(at, op)
+					} else {
+						fail invalid(at, "illegal opcode")
+					}
+			}
+			return none
+		}
+
+		// br_table: every target carries what the default one does.
+		def branchTable(c Cursor, at int) !none {
+			let n = try c.u32()
+			targets.len(0)
+			for let i = 0; i < n; i++ {
+				targets.push(try c.u32())
+			}
+			targets.push(try c.u32())
+			let fallback = try target(at, targets[n])
+			let types = carried(fallback)
+			try expect(at, codeI32)
+			let index = lastLoc
+			for let i = 0; i < n; i++ {
+				let f = try target(at, targets[i])
+				let other = carried(f)
+				fail invalid(at, "type mismatch: br_table targets carry different numbers of values") unless other.len() == types.len()
+				if live {
+					try peek(at, other)
+					continue
+				}
+				// Checked against the stack and put back as found: in
+				// unreachable code an operand keeps standing for any type.
+				kept.len(0)
+				for let k = other.len() - 1; k >= 0; k-- {
+					kept.push(try expect(at, other[k]))
+				}
+				for let k = kept.len() - 1; k >= 0; k-- {
+					push(kept[k])
+				}
+			}
+			if live {
+				try peek(at, types)
+				let arity = types.len()
+				materializeTop(arity)
+				out.push(opBrTable | index << 16 | n << 32)
+				let entry = out.len()
+				// A target whose label takes the values where they are is
+				// jumped to; the others go through code that moves them.
+				for let i = 0; i <= n; i++ {
+					let f = frames[frames.len() - 1 - targets[i]]
+					if f.op == 0 || !inPlace(f, arity) {
+						out.push(-1)
+					} else if f.op == 0x03 {
+						out.push(f.start)
+					} else {
+						out.push(f.chain)
+						f.chain = link(out.len() - 1, 0)
+					}
+				}
+				for let i = 0; i <= n; i++ {
+					continue unless out[entry + i] == -1
+					out[entry + i] = out.len()
+					leaveTo(frames[frames.len() - 1 - targets[i]], arity)
+				}
+			}
+			try popAll(at, types)
+			unreachable()
+			return none
+		}
+
+		// The memory argument of a load or a store whose access is
+		// 2^width bytes; offset is its offset.
+		def memoryArgument(c Cursor, at int, width int) !none {
+			let align = try c.u32()
+			offset = try c.u32()
+			try needMemory(at)
+			fail invalid(at, "alignment must not be larger than natural") when align > width
+			return none
+		}
+
+		// A load or a store, opcodes 0x28 to 0x3e.
+		def access(c Cursor, at int, op int) !none {
+			try memoryArgument(c, at, accessWidths[op - 0x28])
+			let t = accessTypes[op - 0x28]
+			if op >= 0x36 {
+				try expect(at, t)
+				let value = lastLoc
+				try expect(at, codeI32)
+				if live {
+					emit(op, lastLoc, value, 0)
+					word(offset)
+				}
+				return none
+			}
+			try unary(at, op, codeI32, t)
+			more(offset) when live
+			return none
+		}
+
+		// The numeric instructions without immediates, opcodes 0x45 to 0xc4.
+		def numeric(at int, op int) !none {
+			if op <= 0x66 {
+				// Tests and comparisons give an i32.
+				let t = op <= 0x4f ?? (codeI32, op <= 0x5a ?? (codeI64, op <= 0x60 ?? (codeF32, codeF64)))
+				if op := 0x45 || 0x50 {
+					try unary(at, op, t, codeI32)
+				} else {
+					try binary(at, op, t, codeI32)
+				}
+				return none
+			}
+			if op <= 0xa6 {
+				// Operators of one type: the unary ones come first.
+				let t = codeF64
+				let single = op <= 0x9f
+				if op <= 0x78 {
+					t = codeI32
+					single = op <= 0x69
+				} else if op <= 0x8a {
+					t = codeI64
+					single = op <= 0x7b
+				} else if op <= 0x98 {
+					t = codeF32
+					single = op <= 0x91
+				}
+				if single {
+					try unary(at, op, t, t)
+				} else {
+					try binary(at, op, t, t)
+				}
+				return none
+			}
+			try unary(at, op, conversionFrom[op - 0xa7], conversionTo[op - 0xa7])
+			return none
+		}
+
+		// The instructions behind the 0xfc prefix.
+		def prefixed(c Cursor, at int) !none {
+			let op = try c.u32()
+			match op {
+				case 0, 1:
+					try unary(at, 0x100 + op, codeF32, codeI32)
+				case 2, 3:
+					try unary(at, 0x100 + op, codeF64, codeI32)
+				case 4, 5:
+					try unary(at, 0x100 + op, codeF32, codeI64)
+				case 6, 7:
+					try unary(at, 0x100 + op, codeF64, codeI64)
+				case 8:
+					// memory.init
+					let x = try c.u32()
+					try c.skip(1)
+					try needMemory(at)
+					fail invalid(at, "unknown data segment {x}") when x >= m.dataCount
+					try three(at)
+					if live {
+						emit(0x108, first, second, third)
+						word(dataBase + x)
+					}
+				case 9:
+					// data.drop
+					let x = try c.u32()
+					fail invalid(at, "unknown data segment {x}") when x >= m.dataCount
+					out.push(0x109 | (dataBase + x) << 16) when live
+				case 10:
+					// memory.copy
+					try c.skip(2)
+					try needMemory(at)
+					try three(at)
+					emit(0x10a, first, second, third) when live
+				case 11:
+					// memory.fill
+					try c.skip(1)
+					try needMemory(at)
+					try three(at)
+					emit(0x10b, first, second, third) when live
+				case 12:
+					// table.init
+					let x = try c.u32()
+					let y = try c.u32()
+					let into = try table(at, y)
+					fail invalid(at, "unknown elem segment {x}") when x >= m.elements.len()
+					fail invalid(at, "type mismatch: table.init from a segment of other references") unless m.elements[x].kind == into.element
+					try three(at)
+					if live {
+						emit(0x10c, first, second, third)
+						word((elemBase + x) | tableIds[y] << 32)
+					}
+				case 13:
+					// elem.drop
+					let x = try c.u32()
+					fail invalid(at, "unknown elem segment {x}") when x >= m.elements.len()
+					out.push(0x10d | (elemBase + x) << 16) when live
+				case 14:
+					// table.copy
+					let x = try c.u32()
+					let y = try c.u32()
+					let to = try table(at, x)
+					let from = try table(at, y)
+					fail invalid(at, "type mismatch: table.copy between tables of different references") unless to.element == from.element
+					try three(at)
+					if live {
+						emit(0x10e, first, second, third)
+						word(tableIds[x] | tableIds[y] << 32)
+					}
+				case 15:
+					// table.grow
+					let x = try c.u32()
+					let grown = try table(at, x)
+					try expect(at, codeI32)
+					let count = lastLoc
+					try expect(at, grown.element.value)
+					let value = lastLoc
+					let dst = top
+					push(codeI32)
+					if live {
+						define(0x10f, dst, value, count)
+						more(tableIds[x])
+					}
+				case 16:
+					// table.size
+					let x = try c.u32()
+					try table(at, x)
+					let dst = top
+					push(codeI32)
+					if live {
+						define(0x110, dst, 0, 0)
+						out[lastAt] |= tableIds[x] << 32
+					}
+				case 17:
+					// table.fill
+					let x = try c.u32()
+					let filled = try table(at, x)
+					try expect(at, codeI32)
+					let count = lastLoc
+					try expect(at, filled.element.value)
+					let value = lastLoc
+					try expect(at, codeI32)
+					if live {
+						emit(0x111, lastLoc, value, count)
+						word(tableIds[x])
+					}
+				default:
+					fail invalid(at, "illegal opcode")
+			}
+			return none
+		}
+
+		// The vector instructions (0xfd prefix).
+		def vector(c Cursor, at int) !none {
+			let op = try c.u32()
+			if op <= 0x0b || op == 0x5c || op == 0x5d {
+				// Loads, and v128.store.
+				try memoryArgument(c, at, op <= 0x0b ?? (vectorWidths[op.min(0x0b)], op - 0x5a))
+				if op == 0x0b {
+					try expect(at, codeV128)
+					let value = lastLoc
+					try expect(at, codeI32)
+					if live {
+						emit(0x20b, lastLoc, value, 0)
+						word(offset)
+					}
+					return none
+				}
+				try unary(at, 0x200 + op, codeI32, codeV128)
+				more(offset) when live
+				return none
+			}
+			if op == 0x0c {
+				let low = try c.fixed(8)
+				let high = try c.fixed(8)
+				let dst = top
+				push(codeV128)
+				if live {
+					define(opConst2, dst, 0, 0)
+					more(low)
+					more(high)
+				}
+				return none
+			}
+			if op == 0x0d {
+				// i8x16.shuffle picks each byte from the 32 of its operands.
+				let low = try c.fixed(8)
+				let high = try c.fixed(8)
+				fail invalid(at, "invalid lane index") unless ((low | high) & 0xe0e0e0e0e0e0e0e0) == 0
+				try binary(at, 0x20d, codeV128, codeV128)
+				if live {
+					more(low)
+					more(high)
+				}
+				return none
+			}
+			if op >= 0x0f && op <= 0x14 {
+				try unary(at, 0x200 + op, splatTypes[op - 0x0f], codeV128)
+				return none
+			}
+			if op >= 0x15 && op <= 0x22 {
+				let lane = try c.u8()
+				fail invalid(at, "invalid lane index") when lane >= laneCounts[op - 0x15]
+				let t = laneTypes[op - 0x15]
+				if op := 0x17 || 0x1a || 0x1c || 0x1e || 0x20 || 0x22 {
+					// replace_lane
+					try expect(at, t)
+					let value = lastLoc
+					try expect(at, codeV128)
+					let from = lastLoc
+					let dst = top
+					push(codeV128)
+					if live {
+						define(0x200 + op, dst, from, value)
+						more(lane)
+					}
+					return none
+				}
+				try unary(at, 0x200 + op, codeV128, t)
+				out[lastAt] |= lane << 48 when live
+				return none
+			}
+			if op >= 0x54 && op <= 0x5b {
+				// Loads and stores of one lane of 1, 2, 4 or 8 bytes.
+				let width = (op - 0x54) & 3
+				try memoryArgument(c, at, width)
+				let lane = try c.u8()
+				fail invalid(at, "invalid lane index") when lane >= 16 >> width
+				try expect(at, codeV128)
+				let value = lastLoc
+				try expect(at, codeI32)
+				let address = lastLoc
+				if op <= 0x57 {
+					let dst = top
+					push(codeV128)
+					if live {
+						define(0x200 + op, dst, address, value)
+						more(offset | lane << 32)
+					}
+					return none
+				}
+				if live {
+					emit(0x200 + op, address, value, 0)
+					word(offset | lane << 32)
+				}
+				return none
+			}
+			match vectorShape(op) {
+				case VectorShape.Unary:
+					try unary(at, 0x200 + op, codeV128, codeV128)
+				case VectorShape.Binary:
+					try binary(at, 0x200 + op, codeV128, codeV128)
+				case VectorShape.Ternary:
+					try expect(at, codeV128)
+					let mask = lastLoc
+					try binary(at, 0x200 + op, codeV128, codeV128)
+					more(mask) when live
+				case VectorShape.Test:
+					try unary(at, 0x200 + op, codeV128, codeI32)
+				case VectorShape.Shift:
+					try expect(at, codeI32)
+					let count = lastLoc
+					try expect(at, codeV128)
+					let from = lastLoc
+					let dst = top
+					push(codeV128)
+					define(0x200 + op, dst, from, count) when live
+			}
+			return none
+		}
+	}
+}

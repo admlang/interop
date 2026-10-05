@@ -1,0 +1,83 @@
+partial module adm.interop.wasm {
+	use std.errors
+
+	// The type of a WebAssembly value.
+	enum ValueType {
+		I32,
+		I64,
+		F32,
+		F64,
+		V128,
+		FuncRef,
+		ExternRef
+	}
+
+	// What a module imports or exports.
+	enum ExternKind {
+		Function,
+		Table,
+		Memory,
+		Global
+	}
+
+	// The size bounds of a table (in elements) or a memory (in 64 KiB pages).
+	struct Limits {
+		min     int
+		// Meaningful when bounded is true.
+		max     int
+		bounded bool
+	}
+
+	// What a table holds and how large it may be.
+	struct TableType {
+		element ValueType
+		limits  Limits
+	}
+
+	// Value is a WebAssembly value. bits holds an i32 or an i64 as the
+	// integer, an f32 or an f64 as its IEEE 754 bits, and a reference as 0
+	// for null or a number the store gave; a v128 is bits (low half) and
+	// high.
+	struct Value {
+		kind ValueType
+		bits int
+		high int
+	}
+
+	// HostFunction is an ADM function WebAssembly code calls: it gets the
+	// call's arguments and returns its results.
+	type HostFunction = def(Value[]) !Value[]
+
+	// Extern is something a module imports or exports, as the store knows
+	// it: `id` numbers the function, table or memory, or is the slot of the
+	// global, whose value has the type `content` and can be set when `mutable`.
+	struct Extern {
+		kind    ExternKind
+		id      int
+		content ValueType
+		mutable bool
+	}
+
+	// ModuleError is why a binary is not a WebAssembly module: `code` is
+	// "malformed" for bytes that do not follow the binary format and
+	// "invalid" for a module that breaks a validation rule. offset is the
+	// position of the problem in the binary, -1 when it has none.
+	struct ModuleError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		offset  int
+	}
+
+	// Trap is why running WebAssembly code stopped: a fault of the code
+	// itself (`code` is "trap": division by zero, an access out of bounds,
+	// unreachable, ...) or a limit of the store ("exhausted": the call
+	// stack or the fuel ran out).
+	struct Trap {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+	}
+}

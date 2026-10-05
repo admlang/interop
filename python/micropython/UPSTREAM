@@ -1,0 +1,32 @@
+MicroPython 1.29.0, from the release tarball.
+https://github.com/micropython/micropython/releases/download/v1.29.0/micropython-1.29.0.tar.xz
+License: MIT (LICENSE in this folder, the release's).
+
+sha256  d925a7c664e79a2bdf3dfcb285ba5e2237041cc35a0bd4ee573b6c5711efeca0  micropython-1.29.0.tar.xz
+sha256  36c857c3ade078074bb859ecd2488010f442ab17680b066f05d81366b33e0cb4  micropython-amalgam.c
+sha256  91a7311f4a66ef3de3996c71c172ddd1cea456d949d8027f8d1f5e85a52712bb  micropython.h
+
+micropython.h and micropython-amalgam.c are generated and hold the release's sources
+unmodified. micropython.h is every header adm_mpy.c needs (py/runtime.h and what it reaches),
+with the configuration (mpconfigport.h, mphalport.h in this folder) and the headers the
+release's build generates from it (qstrdefs.generated.h, moduledefs.h, root_pointers.h,
+mpversion.h) inlined. micropython-amalgam.c is py/*.c, extmod/modjson.c, modre.c (with
+lib/re1.5), modheapq.c, modbinascii.c, modrandom.c and shared/runtime/gchelper_generic.c, in
+that order. A header with an include guard is inlined where first included; the qstr and grammar
+tables, which MicroPython reads several times under different macros, every time. After each
+source the macros it defined are undefined, and modbinascii.c's bytes_fromhex_obj, a file-local
+name objstr.c also uses, is renamed with a #define around the file. Both files set hidden
+visibility after the C library's headers, so MicroPython stays inside the program, and define
+NDEBUG.
+
+Left out by the configuration: files, the os, time, select, asyncio, machine, hashlib, deflate
+and platform modules, the native emitters, threads, the REPL.
+
+To regenerate, in a scratch folder holding copies of mpconfigport.h and mphalport.h:
+    make -f <here>/genhdr.mk MICROPYTHON_TOP=<micropython-1.29.0> BUILD=build
+    python3 <here>/amalgam.py <micropython-1.29.0> build/genhdr <here>
+The first step needs python3 and a C compiler; a change to mpconfigport.h or qstrdefsport.h
+(the names adm_mpy.c adds) needs both steps.
+
+adm_mpy.c, amalgam.py, genhdr.mk, mpconfigport.h, mphalport.h and qstrdefsport.h in this
+folder are not part of MicroPython.

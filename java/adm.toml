@@ -1,0 +1,16 @@
+# adm.toml
+#
+# The publisher section is missing: run `adm app init --publisher admlang` in
+# this folder before building the library for publication.
+
+schema = 1
+
+# What ships beside the sources: the C that loads the Java VM and talks to
+# it, compiled into every program that uses the library.
+[[package.files]]
+from = "jvm/adm_jvm.c"
+to = "jvm/adm_jvm.c"
+
+[publisher]
+pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
+repo_salt = "base64:hOWix608hJUbhIk1aM7IJV+LQvn8cLlkxduLmuOVMXE="

@@ -1,0 +1,106 @@
+partial module adm.interop.java {
+	use std.testing
+
+	// What a call across the boundary costs, each way. Run with
+	// `adm test --release --bench .`.
+	check "Benchmarks" {
+		let math ?Value = none
+		let thousand ?Value = none
+		let echo ?Value = none
+		let numbers float[]
+
+		// The class java.lang.Math, loaded once.
+		def mathClass() !Value {
+			let known = math
+			if known is none {
+				try sample()
+				let made = try runtime().load("java.lang.Math")
+				math = made
+				return made
+			}
+			return known
+		}
+
+		// A list of a thousand elements, made once.
+		def thousandElements() !Value {
+			let known = thousand
+			if known is none {
+				try sample()
+				let made = try (try runtime().load("java.util.Collections")).invoke("nCopies", 1000, 7)
+				thousand = made
+				return made
+			}
+			return known
+		}
+
+		// An ADM function that returns its argument, made once.
+		def echoFunction() !Value {
+			let known = echo
+			if known is none {
+				try sample()
+				let made = try runtime().function(def (args Value[]) !Value {
+					return args[0]
+				})
+				echo = made
+				return made
+			}
+			return known
+		}
+
+		@benchmark()
+		def number_to_java() !none {
+			let _ = try runtime().value(42)
+			return none
+		}
+
+		@benchmark()
+		def declared_call_with_numbers() !none {
+			try sample()
+			let _ = try add(20, 22)
+			return none
+		}
+
+		@benchmark()
+		def declared_call_with_a_string() !none {
+			try sample()
+			let _ = try greet("adm")
+			return none
+		}
+
+		@benchmark()
+		def declared_call_with_thousand_floats() !none {
+			try sample()
+			if numbers.len() == 0 {
+				for let i = 0; i < 1000; i++ {
+					numbers.push(float(i))
+				}
+			}
+			let _ = try sum(numbers)
+			return none
+		}
+
+		@benchmark()
+		def invoke_static_method() !none {
+			let _ = try (try mathClass()).invoke("max", 3, 9)
+			return none
+		}
+
+		@benchmark()
+		def invoke_and_read_result() !none {
+			let _ = try (try (try mathClass()).invoke("max", 3, 9)).asInt()
+			return none
+		}
+
+		@benchmark()
+		def read_static_field() !none {
+			let _ = try (try mathClass()).get("PI")
+			return none
+		}
+
+		@benchmark()
+		def thousand_host_calls_from_java() !none {
+			try (try thousandElements()).invoke("forEach", try echoFunction())
+			return none
+		}
+	}
+}

@@ -1,0 +1,386 @@
+partial module adm.interop.dotnet {
+	use (
+		adm.interop.dotnet.engine::(machine)
+		std.errors
+		std.testing
+	)
+
+	internal struct StockError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		wanted  int
+	}
+
+	internal struct Parcel {
+		label  string
+		weight int
+	}
+
+	// What an error says when it is a ScriptError: its code, else "".
+	internal def codeOf(err error) string {
+		return err.code when err is ScriptError
+		return ""
+	}
+
+	check "DotnetValues" {
+		@test()
+		def constructs_and_invokes() !none {
+			try sample()
+			let dotnet = runtime()
+			let list = try (try dotnet.load("System.Collections.ArrayList")).construct()
+			assert list.kind() == Kind.Object
+			try list.invoke("Add", "ADM")
+			try list.invoke("Add", 42)
+			assert try (try list.get("Count")).asInt() == 2
+			assert try list.len() == 2
+			assert try (try list.get(0)).asString() == "ADM"
+			assert try (try list.get(1)).asInt() == 42
+			try list.set(1, 2.5)
+			assert try (try list.get(1)).asFloat() == 2.5
+			let builder = try (try dotnet.load("System.Text.StringBuilder")).construct("a")
+			try builder.invoke("Append", 42)
+			try builder.invoke("Append", true)
+			try builder.invoke("Append", "!")
+			assert try builder.text() == "a42True!"
+			assert "{builder}" == "a42True!"
+			// A static method, a member of the type object itself, a generic
+			// type by its .NET name.
+			let math = try dotnet.load("System.Math")
+			assert math.kind() == Kind.Type
+			assert try (try math.invoke("Max", 3, 9)).asInt() == 9
+			assert try (try math.get("FullName")).asString() == "System.Math"
+			let names = try (try dotnet.load("System.Collections.Generic.List`1[System.String]")).construct()
+			try names.invoke("Add", "k")
+			assert try (try names.get(0)).asString() == "k"
+			// Members of a string and of a number.
+			let word = try dotnet.value("adm")
+			assert try (try word.invoke("ToUpperInvariant")).asString() == "ADM"
+			assert try word.len() == 3
+			assert try (try word.get("Length")).asInt() == 3
+			assert try (try dotnet.value(1.5)).text() == "1.5"
+			// Two objects that are equal without being the same one.
+			let version = try dotnet.load("System.Version")
+			let first = try version.construct(1, 2)
+			let second = try version.construct(1, 2)
+			assert try first.equals(second)
+			assert !first.same(second) && first.same(first)
+			assert !(try first.equals(word))
+			assert (try dotnet.value(7)).same(try dotnet.value(7))
+			return none
+		}
+
+		@test()
+		def converts_values() !none {
+			try sample()
+			let dotnet = runtime()
+			let s = try dotnet.load("Acme.Sample")
+			assert try (try s.invoke("TypeOf", 5)).asString() == "System.Int32"
+			assert try (try s.invoke("TypeOf", 5000000000)).asString() == "System.Int64"
+			assert try (try s.invoke("TypeOf", 1.5)).asString() == "System.Double"
+			assert try (try s.invoke("TypeOf", true)).asString() == "System.Boolean"
+			assert try (try s.invoke("TypeOf", "x")).asString() == "System.String"
+			assert try (try s.invoke("TypeOf", none)).asString() == "null"
+			assert try (try s.invoke("TypeOf", int[1, 2])).asString() == "System.Int64[]"
+			assert try (try s.invoke("TypeOf", int32[1, 2])).asString() == "System.Int32[]"
+			assert try (try s.invoke("TypeOf", uint16[1, 2])).asString() == "System.UInt16[]"
+			assert try (try s.invoke("TypeOf", [1.5])).asString() == "System.Double[]"
+			assert try (try s.invoke("TypeOf", ["a"])).asString() == "System.String[]"
+			assert try (try s.invoke("TypeOf", [true])).asString() == "System.Boolean[]"
+			assert try (try s.invoke("TypeOf", byte[1, 2])).asString() == "System.Byte[]"
+			assert (try s.invoke("Echo", none)).isNone()
+			assert try (try s.invoke("Echo", -3)).asInt() == -3
+			assert try (try s.invoke("Echo", 0.25)).asFloat() == 0.25
+			assert try (try s.invoke("Echo", 4)).asFloat() == 4.0
+			assert try (try s.invoke("Echo", 4.0)).asInt() == 4
+			assert try (try s.invoke("Echo", false)).asBool() == false
+			assert try (try s.invoke("Echo", "naïve 😀")).asString() == "naïve 😀"
+			// An integer goes where an enum is taken.
+			assert try (try s.invoke("Name", 1)).asString() == "Dark"
+			// A float goes where a .NET float is taken only when it survives.
+			assert try (try s.invoke("Narrow", 0.5)).asFloat() == 0.5
+			let code = ""
+			s.invoke("Narrow", 0.1) onerror (err error) {
+				code = codeOf(err)
+				recover try dotnet.null()
+			}
+			assert code == "binding"
+			let raw = try dotnet.bytes(byte[1, 2, 250])
+			assert raw.kind() == Kind.Array
+			assert (try raw.asBytes()).hex() == "0102FA"
+			assert (try (try s.invoke("Reversed", raw)).asBytes()).hex() == "FA0201"
+			let nested = try dotnet.value([[1, 2], [3]])
+			assert try (try s.invoke("TypeOf", nested)).asString() == "System.Object[]"
+			assert try (try (try nested.get(1)).get(0)).asInt() == 3
+			let ages = try dotnet.value({"ada": 36, "alan": 41})
+			assert try (try ages.invoke("get_Item", "alan")).asInt() == 41
+			assert try ages.len() == 2
+			code = ""
+			(try dotnet.value("text")).asInt() onerror (err error) {
+				code = codeOf(err)
+				recover 0
+			}
+			assert code == "conversion"
+			return none
+		}
+
+		@test()
+		def reads_and_writes_members() !none {
+			try sample()
+			let dotnet = runtime()
+			assert try (try dotnet.get("Acme.Counter", "Total")).asInt() == 7
+			let counters = try dotnet.load("Acme.Counter")
+			try counters.set("Total", 9)
+			assert try (try counters.get("Total")).asInt() == 9
+			try counters.set("Total", 7)
+			let one = try counters.construct("box", 3)
+			assert try (try one.get("Label")).asString() == "box"
+			assert try (try one.invoke("Bump", 4)).asInt() == 7
+			assert try (try one.invoke("Bump")).asInt() == 8
+			assert try (try one.get("Count")).asInt() == 8
+			try one.set("Label", none)
+			assert (try one.get("Label")).isNone()
+			let numbers = try (try dotnet.load("int[]")).construct(3)
+			try numbers.set(2, 11)
+			assert try (try numbers.get(2)).asInt() == 11
+			assert try (try numbers.get("Length")).asInt() == 3
+			assert try numbers.len() == 3
+			let message = ""
+			one.get("Weight") onerror (err error) {
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: a Acme.Counter has no field or property Weight"
+			message = ""
+			one.set("Count", "many") onerror (err error) {
+				message = "{codeOf(err)}: {err.message}"
+				recover none
+			}
+			assert message == "conversion: dotnet: field Count of a Acme.Counter is a int, which cannot take a string"
+			message = ""
+			numbers.get(3) onerror (err error) {
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: index 3 is outside 0..2"
+			return none
+		}
+
+		@test()
+		def picks_the_overload_that_fits() !none {
+			try sample()
+			let dotnet = runtime()
+			let s = try dotnet.load("Acme.Sample")
+			let counters = try dotnet.load("Acme.Counter")
+			let one = try counters.construct()
+			assert try (try one.invoke("Describe", 1)).asString() == "long 1"
+			assert try (try one.invoke("Describe", 1.5)).asString() == "double 1.5"
+			assert try (try one.invoke("Describe", "x")).asString() == "string x"
+			assert try (try one.invoke("Describe", true)).asString() == "object True"
+			assert try (try one.invoke("Describe", none)).asString() == "string "
+			assert try (try s.invoke("JoinAll", "-", 1, "b", true)).asString() == "1-b-True"
+			assert try (try s.invoke("JoinAll", "-")).asString() == ""
+			let message = ""
+			let code = ""
+			one.invoke("Bump", "far") onerror (err error) {
+				message = err.message
+				code = codeOf(err)
+				recover try dotnet.null()
+			}
+			assert code == "binding" && message == "dotnet: Acme.Counter has no method Bump that takes (a string)"
+			message = ""
+			one.invoke("Vanish") onerror (err error) {
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: Acme.Counter has no method Vanish"
+			message = ""
+			counters.construct(1, 2, 3) onerror (err error) {
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: type Acme.Counter has no public constructor that takes (an integer, an integer, an integer)"
+			message = ""
+			dotnet.load("No.Such.Type") onerror (err error) {
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: type No.Such.Type was not found in the assembly folders"
+			return none
+		}
+
+		@test()
+		def dotnet_calls_adm_functions() !none {
+			try sample()
+			let dotnet = runtime()
+			let s = try dotnet.load("Acme.Sample")
+			let shout = try dotnet.function(def (args Value[]) !Value {
+				return try dotnet.value("{try args[0].asString()}!")
+			})
+			assert shout.kind() == Kind.Function
+			assert try (try s.invoke("Apply", shout, "hey")).asString() == "hey!"
+			let double = try dotnet.function(def (args Value[]) !Value {
+				return try dotnet.value(2 * try args[0].asInt())
+			})
+			assert try (try s.invoke("Twice", double, 5)).asInt() == 20
+			// A delegate of a named type from the start.
+			let supplier = try dotnet.function(def (args Value[]) !Value {
+				return try dotnet.value("made")
+			}, "System.Func`1[System.Object]")
+			assert supplier.kind() == Kind.Object
+			assert try (try supplier.invoke("Invoke")).asString() == "made"
+			// A function behind an interface.
+			let byLength = try dotnet.function(def (args Value[]) !Value {
+				return try dotnet.value((try args[0].asString()).len() - (try args[1].asString()).len())
+			})
+			assert try (try s.invoke("Order", byLength, "ccc", "a")).asInt() == 2
+			// A function that calls back into .NET while .NET waits for it.
+			let nested = try dotnet.function(def (args Value[]) !Value {
+				return try s.invoke("Apply", shout, try args[0].asString())
+			})
+			assert try (try s.invoke("Apply", nested, "deep")).asString() == "deep!"
+			// A call from a thread .NET started.
+			assert try (try s.invoke("Later", try dotnet.function(def (args Value[]) !Value {
+				return try dotnet.value(99)
+			}))).asInt() == 99
+			let sorted = try (try dotnet.load("System.Collections.Generic.List`1[System.String]")).construct()
+			try sorted.invoke("Add", "ccc")
+			try sorted.invoke("Add", "a")
+			try sorted.invoke("Add", "bb")
+			try sorted.invoke("Sort", byLength)
+			assert try (try sorted.get(0)).asString() == "a"
+			assert try (try sorted.get(2)).asString() == "ccc"
+			let message = ""
+			dotnet.function(passThrough, "System.String") onerror (err error) {
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: string is not a delegate type or an interface: an ADM function stands in for one of those"
+			return none
+		}
+
+		@test()
+		def errors_cross_both_ways() !none {
+			try sample()
+			let dotnet = runtime()
+			let s = try dotnet.load("Acme.Sample")
+			// What .NET throws, as a value.
+			let message = ""
+			let trace = ""
+			let reason = ""
+			s.invoke("Refuse", "no stock") onerror (err error) {
+				message = err.message
+				if err is ScriptError {
+					trace = err.trace
+					let thrown = err.value
+					reason = (thrown.get("Message") onerror recover thrown).str() unless thrown is none
+				}
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: System.InvalidOperationException: no stock"
+			assert reason == "no stock" && trace.contains("at Acme.Sample.Refuse(")
+			// An ADM error a function fails with comes back as it was.
+			let failing = try dotnet.function(alwaysFails)
+			let code = ""
+			s.invoke("Apply", failing, 1) onerror (err error) {
+				code = err.code
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert code == "out-of-stock" && message == "nothing left"
+			let wanted = 0
+			s.invoke("Apply", failing, 1) onerror (err error) {
+				wanted = err.wanted when err is StockError
+				recover try dotnet.null()
+			}
+			assert wanted == 1
+			// The same through a thread .NET started.
+			code = ""
+			s.invoke("Later", failing) onerror (err error) {
+				code = err.code
+				recover try dotnet.null()
+			}
+			assert code == "out-of-stock"
+			// A .NET exception a function lets through stays that exception.
+			let through = try dotnet.function(def (args Value[]) !Value {
+				return try s.invoke("Refuse", "inner")
+			})
+			message = ""
+			s.invoke("Apply", through, 1) onerror (err error) {
+				message = err.message
+				recover try dotnet.null()
+			}
+			assert message == "dotnet: System.InvalidOperationException: inner"
+			return none
+		}
+
+		@test()
+		def dotnet_holds_adm_objects() !none {
+			try sample()
+			let dotnet = runtime()
+			let s = try dotnet.load("Acme.Sample")
+			let held = try dotnet.foreign(Parcel{label: "books", weight: 12})
+			assert held.kind() == Kind.Foreign
+			let back = try s.invoke("Echo", held)
+			assert back.kind() == Kind.Foreign && back.same(held)
+			let obj = back.foreign()
+			fail "the object is gone" when obj is none
+			let weight = 0
+			weight = obj.weight when obj is Parcel
+			assert weight == 12
+			// A struct given as an argument crosses the same way.
+			let again = try s.invoke("Echo", Parcel{label: "pens", weight: 1})
+			assert again.kind() == Kind.Foreign
+			assert (try dotnet.value(3)).foreign() is none
+			return none
+		}
+
+		@test()
+		def forgets_what_is_dropped() !none {
+			try sample()
+			let dotnet = runtime()
+			dotnet.collect()
+			let before = dotnet.live()
+			try fill(dotnet)
+			// Dropped handles travel with the next request.
+			let after = dotnet.live()
+			assert after == before
+			assert dotnet.memory() > 0
+			let kept = machine.counts.len()
+			try lend(dotnet)
+			let left = kept + 1
+			for let i = 0; i < 50 && left > kept; i++ {
+				dotnet.collect()
+				left = machine.counts.len()
+			}
+			assert left == kept
+			return none
+		}
+	}
+
+	internal def passThrough(args Value[]) !Value {
+		return args[0]
+	}
+
+	internal def alwaysFails(args Value[]) !Value {
+		fail StockError{message: "nothing left", code: "out-of-stock", wanted: args.len()}
+	}
+
+	// Makes and drops .NET objects.
+	internal def fill(dotnet Runtime) !none {
+		let lists = try dotnet.load("System.Collections.ArrayList")
+		for let i = 0; i < 100; i++ {
+			let list = try lists.construct()
+			try list.invoke("Add", i)
+		}
+		return none
+	}
+
+	// Gives .NET a function and an object it drops again.
+	internal def lend(dotnet Runtime) !none {
+		let s = try dotnet.load("Acme.Sample")
+		try s.invoke("Apply", try dotnet.function(passThrough), try dotnet.foreign(Parcel{label: "x", weight: 1}))
+		return none
+	}
+}

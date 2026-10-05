@@ -1,0 +1,42 @@
+partial module adm.interop.dotnet {
+	use (
+		adm.interop.dotnet.engine::*
+		std.reflection::(FunctionMetaContext)
+	)
+
+	internal let shared = new Runtime()
+
+	// The program's .NET runtime. It starts when it is first used, loading
+	// assemblies from the current folder; call its start() before that to
+	// name the folders.
+	def runtime() Runtime {
+		return shared
+	}
+
+	// Binds a function declared without a body to the static method of the
+	// same name in a .NET type:
+	//
+	//     @dotnet("Acme.Billing")
+	//     def total(prices float[], quantity int32) !float;
+	//
+	// The type is named as Runtime.load names it. The declaration `total`
+	// binds the method `total` or `Total`; `method` names it when it is
+	// spelled otherwise. The method is the one whose parameters are exactly
+	// the declaration's: bool is bool, int8 sbyte, byte byte, int16 short,
+	// uint16 ushort, int32 int, uint32 uint, int long, uint ulong, float32
+	// float, float double, string string, and an array of one of those the
+	// .NET array. The result follows the same table; `?string` and `?T[]`
+	// take null as none. Arrays and strings are copied each way.
+	//
+	// A .NET exception, a missing type or method, and a null where none is
+	// declared fail an errorable declaration with a ScriptError, and panic
+	// with its message when the declaration cannot fail.
+	meta def dotnet(target FunctionMetaContext, typeName string, method string = "") {
+		let failure ?error = none
+		answer(target, typeName, method) onerror (err error) {
+			failure = err
+			recover none
+		}
+		target.reject(failure) unless failure is none
+	}
+}

@@ -8,9 +8,10 @@ the `admlang` publisher.
 |---------|---|---|---|
 | [`adm.interop.js`](js/) | JavaScript | QuickJS-ng 0.17.0 | Run scripts and ES modules, exchange values, call in both directions |
 | [`adm.interop.lua`](lua/) | Lua | Lua 5.4.8 | Run scripts and modules, exchange values, call in both directions |
-|-|Python|-|In progress|
-|-|Java|-|In progress|
-|-|WebAssembly|-|In progress|
+| [`adm.interop.python`](python/) | Python | MicroPython 1.29.0 | Run scripts and modules, exchange values, call in both directions |
+| [`adm.interop.java`](java/) | Java | the installed Java VM (Java 8 or later) | Load classes, make and call objects, bind static methods to declarations, call in both directions |
+| [`adm.interop.dotnet`](dotnet/) | C#, F#, VB | the installed .NET runtime (.NET 8 or later) | Load types, make and call objects, bind static methods to declarations, call in both directions |
+| [`adm.interop.wasm`](wasm/) | WebAssembly | written in ADM | Decode, validate and run WebAssembly 2.0 modules; WASI in progress |
 
 ## Install
 
@@ -24,4 +25,5 @@ Each library's README covers its use.
 
 ## License
 
-The engines keep their own licenses, recorded beside their sources (`js/quickjs/LICENSE`, `lua/lua/LICENSE`).
+The engines keep their own licenses, recorded beside their sources (`js/quickjs/LICENSE`, `lua/lua/LICENSE`,
+`python/micropython/LICENSE`).

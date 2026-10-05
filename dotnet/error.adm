@@ -1,0 +1,55 @@
+partial module adm.interop.dotnet {
+	use std.errors
+
+	// What a .NET value is.
+	enum Kind {
+		Null,
+		Bool,
+		// An integer of any width; an unsigned 64-bit one keeps its bits.
+		Integer,
+		// A float or a double.
+		Float,
+		// A string or a char.
+		String,
+		Array,
+		// Any other object: an instance, a boxed struct, a delegate.
+		Object,
+		// A type, whose static members and constructors the value gives.
+		Type,
+		// An ADM function .NET has not been given yet; it becomes a
+		// delegate or an object of the interface it is passed as.
+		Function,
+		// An ADM object .NET holds without seeing inside it.
+		Foreign
+	}
+
+	// Why a call into .NET failed.
+	enum ScriptFailure {
+		// The .NET code threw.
+		Thrown,
+		// A type or a member was not found, or no method takes the
+		// arguments.
+		Binding,
+		// No .NET runtime could be started.
+		Unavailable,
+		// A value was not what the caller asked for.
+		Conversion
+	}
+
+	// ScriptError is the failure of a call into .NET or of a conversion. A
+	// handler that narrows with `err is ScriptError` reads `kind`, the .NET
+	// stack trace (`trace`) and the exception itself.
+	struct ScriptError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ScriptFailure
+		// The exception as .NET prints it, with its stack trace; "" when
+		// nothing was thrown.
+		trace   string
+		// The exception .NET threw; none for failures that are not
+		// exceptions.
+		value   ?Value
+	}
+}

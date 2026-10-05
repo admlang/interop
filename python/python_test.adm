@@ -1,0 +1,561 @@
+partial module adm.interop.python {
+	use (
+		std.errors
+		std.testing
+		std.time
+	)
+
+	// An ADM error with a payload, to check it survives a trip through a script.
+	internal struct QuotaError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		used    int
+	}
+
+	internal struct Account {
+		owner   string
+		balance float
+		labels  string[]
+	}
+
+	// The runtime the last test opened. A host function that captures its
+	// runtime keeps it alive, so the next test closes it.
+	internal type Opened {
+		last ?Runtime
+
+		def dispose() {
+			let known = last
+			dispose known unless known is none
+		}
+	}
+
+	internal let opened = new Opened()
+
+	// The program's one runtime, opened anew: the last test's is closed
+	// first, and so is the one the declarations of the other suite run in.
+	internal def fresh(memoryLimit int = 0, timeout duration = 0s) !Runtime {
+		let declared = shared.made
+		try declared.close() unless declared is none
+		let last = opened.last
+		try last.close() unless last is none
+		let made = new Runtime(memoryLimit, timeout = timeout)
+		opened.last = made
+		return made
+	}
+
+	// The failure of statements that must fail, as a ScriptError.
+	internal def failureOf(py Runtime, code string) !ScriptError {
+		let found ?ScriptError = none
+		py.exec(code) onerror (err error) {
+			found = err when err is ScriptError
+			recover none
+		}
+		fail "the script did not fail: {code}" when found is none
+		return found
+	}
+
+	// Calls the script function `spin` a number of times from its own task.
+	internal async def hammer(py Runtime, rounds int) !int {
+		let spin = try py.eval("spin")
+		let total = 0
+		for let i = 0; i < rounds; i++ {
+			total += try (try spin.call(i)).asInt()
+		}
+		return total
+	}
+
+	// Interrupts the runtime after a pause.
+	internal async def interruptLater(py Runtime, pause duration) {
+		time.sleep(pause)
+		py.interrupt()
+	}
+
+	// Hands the script an ADM object and drops the handle to it.
+	internal def lendAccount(py Runtime) !none {
+		let held = try py.foreign(Account{owner: "Bob", balance: 2.0, labels: []})
+		assert held.kind() == Kind.Foreign
+		return none
+	}
+
+	check "Runtime" {
+		@test()
+		def evaluates_scalars() !none {
+			let py = try fresh()
+			assert try (try py.eval("1 + 2")).asInt() == 3
+			assert (try py.eval("1 + 2")).kind() == Kind.Int
+			assert (try py.eval("1 / 2")).kind() == Kind.Float
+			assert try (try py.eval("1 / 2")).asFloat() == 0.5
+			assert try (try py.eval("6 / 2")).asInt() == 3
+			assert try (try py.eval("'hé' + 'llo'")).asString() == "héllo"
+			assert try (try py.eval("1 < 2")).asBool()
+			assert (try py.eval("None")).isNone()
+			assert (try py.eval("1")).truthy()
+			assert !(try py.eval("0")).truthy()
+			assert !(try py.eval("[]")).truthy()
+			assert "{try py.eval("42")}" == "42"
+			assert try (try py.eval("2 ** 63 - 1")).asInt() == 9223372036854775807
+			assert try (try py.eval("-2 ** 63")).asInt() == -9223372036854775807 - 1
+			assert try (try py.eval("2 ** 100")).text() == "1267650600228229401496703205376"
+			assert try (try py.eval("'a\\nb'")).repr() == "'a\\nb'"
+			assert try (try py.eval("__import__('sys').implementation.name")).asString() == "micropython"
+			return none
+		}
+
+		@test()
+		def refuses_wrong_conversions() !none {
+			let py = try fresh()
+			let text = try py.eval("'x'")
+			let n = text.asInt() onerror recover -1
+			assert n == -1
+			let half = (try py.eval("1.5")).asInt() onerror recover -1
+			assert half == -1
+			let wide = (try py.eval("2 ** 64")).asInt() onerror recover -1
+			assert wide == -1
+			let flag = (try py.eval("1")).asBool() onerror recover false
+			assert !flag
+			let s = (try py.eval("1")).asString() onerror recover "no"
+			assert s == "no"
+			let raw = (try py.eval("'text'")).asBytes() onerror recover byte[]
+			assert raw.len() == 0
+			return none
+		}
+
+		@test()
+		def names_the_kinds() !none {
+			let py = try fresh()
+			assert (try py.eval("b'ab'")).kind() == Kind.Bytes
+			assert (try py.eval("bytearray(2)")).kind() == Kind.Bytes
+			assert (try py.eval("[1]")).kind() == Kind.List
+			assert (try py.eval("(1, 2)")).kind() == Kind.Tuple
+			assert (try py.eval("\{'a': 1\}")).kind() == Kind.Dict
+			assert (try py.eval("len")).kind() == Kind.Function
+			assert (try py.eval("lambda: 1")).kind() == Kind.Function
+			assert (try py.eval("int")).kind() == Kind.Function
+			assert (try py.load("math")).kind() == Kind.Module
+			assert (try py.eval("\{1, 2\}")).kind() == Kind.Object
+			assert (try py.eval("ValueError('x')")).kind() == Kind.Object
+			assert (try py.eval("True")).kind() == Kind.Bool
+			return none
+		}
+
+		@test()
+		def converts_adm_values() !none {
+			let py = try fresh()
+			let show = try py.eval("lambda items: ','.join(str(v) for v in items)")
+			assert try (try py.value(42)).asInt() == 42
+			assert try (try py.value(2.5)).asFloat() == 2.5
+			assert try (try py.value("héllo")).asString() == "héllo"
+			assert try (try py.value(true)).asBool()
+			let numbers int[] = [1, 2, 3]
+			assert (try py.value(numbers)).kind() == Kind.List
+			assert try (try show.call(numbers)).asString() == "1,2,3"
+			let table map<string, string>
+			table["a"] = "x"
+			table["b"] = "y"
+			let converted = try py.value(table)
+			assert converted.kind() == Kind.Dict
+			assert try (try converted.get("b")).asString() == "y"
+			let account = Account{owner: "Ada", balance: 12.5, labels: ["a", "b"]}
+			let copied = try py.copy(account)
+			assert try (try copied.get("owner")).asString() == "Ada"
+			assert try (try copied.get("balance")).asFloat() == 12.5
+			assert try (try show.call(try copied.get("labels"))).asString() == "a,b"
+			assert (try py.value(none)).isNone()
+			let pair = try py.tuple(1, "two", 3.0)
+			assert pair.kind() == Kind.Tuple && try pair.len() == 3
+			assert try (try pair.get(1)).asString() == "two"
+			return none
+		}
+
+		@test()
+		def reads_and_writes_containers() !none {
+			let py = try fresh()
+			let user = try py.eval("\{'name': 'Ada', 'langs': ['adm', 'python'], 10: 'ten'\}")
+			assert user.kind() == Kind.Dict
+			assert try (try user.get("name")).asString() == "Ada"
+			let langs = try user.get("langs")
+			assert try langs.len() == 2
+			assert try (try langs.get(0)).asString() == "adm"
+			assert try (try langs.get(-1)).asString() == "python"
+			let past = langs.get(2) onerror recover langs
+			assert past.same(langs)
+			try user.set("age", 36)
+			try langs.append("c")
+			try langs.set(0, "ADM")
+			assert try langs.len() == 3
+			assert try (try langs.get(0)).asString() == "ADM"
+			assert try langs.contains("c")
+			assert !(try langs.contains("d"))
+			assert try user.has("age")
+			assert !(try user.has("missing"))
+			assert try (try user.item(10)).asString() == "ten"
+			try user.setItem(11, "eleven")
+			assert try user.contains(11)
+			try user.removeItem(11)
+			assert !(try user.contains(11))
+			let keys = try user.keys()
+			assert keys.join(",") == "name,langs,age"
+			try user.remove("age")
+			assert !(try user.has("age"))
+			assert try (try (try user.attr("get")).call("nope", 7)).asInt() == 7
+			let missing = user.get("nope") onerror (err error) {
+				assert err.message.contains("KeyError")
+				recover user
+			}
+			assert missing.same(user)
+			let made = try py.dict()
+			try made.set("k", [1, 2])
+			assert try (try made.get("k")).len() == 2
+			let items = try py.list()
+			try items.append("a")
+			assert items.kind() == Kind.List && try items.len() == 1
+			return none
+		}
+
+		@test()
+		def reads_and_writes_attributes() !none {
+			let py = try fresh()
+			try py.exec("class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def norm1(self):\n        return abs(self.x) + abs(self.y)\n")
+			let point = try (try py.eval("Point")).call(3, -4)
+			assert point.kind() == Kind.Object
+			assert try (try point.get("x")).asInt() == 3
+			try point.set("x", 10)
+			try point.setAttr("z", 1)
+			assert try (try point.invoke("norm1")).asInt() == 14
+			assert try point.has("z")
+			try point.remove("z")
+			assert !(try point.has("z"))
+			let global = try py.global()
+			try global.set("answer", 42)
+			assert try (try py.eval("answer + 1")).asInt() == 43
+			assert (try global.get("Point")).same(try py.eval("Point"))
+			let broken = (try py.eval("5")).get("x") onerror (err error) {
+				assert err.message.contains("AttributeError")
+				recover global
+			}
+			assert broken.same(global)
+			assert (try py.eval("[1, 2]")).equals(try py.eval("[1, 2]"))
+			assert !(try py.eval("[1, 2]")).same(try py.eval("[1, 2]"))
+			return none
+		}
+
+		@test()
+		def calls_functions() !none {
+			let py = try fresh()
+			let add = try py.eval("lambda a, b: a + b")
+			assert add.kind() == Kind.Function
+			assert try (try add.call(2, 3)).asInt() == 5
+			assert try (try add.call(1.5, 2)).asFloat() == 3.5
+			let both = try (try py.eval("divmod")).call(17, 5)
+			assert both.kind() == Kind.Tuple
+			assert try (try both.get(0)).asInt() == 3 && try (try both.get(1)).asInt() == 2
+			try py.exec("class Counter:\n    n = 0\n    def add(self, by=1):\n        self.n += by\n        return self.n\ncounter = Counter()\n")
+			let counter = try py.eval("counter")
+			assert try (try counter.invoke("add", 5)).asInt() == 5
+			assert try (try counter.invoke("add")).asInt() == 6
+			let step map<string, any>
+			step["by"] = 4
+			let noArgs any[]
+			assert try (try counter.invoke("add", noArgs, step)).asInt() == 10
+			let many = try py.eval("lambda *args: len(args)")
+			assert try (try many.call(1, 2, 3, 4, 5, 6, 7)).asInt() == 7
+			let named map<string, any>
+			named["sep"] = "-"
+			named["end"] = "!"
+			let join = try py.eval("lambda *parts, sep=' ', end='': sep.join(parts) + end")
+			let parts any[] = ["a", "b"]
+			assert try (try join.call(parts, named)).asString() == "a-b!"
+			let notCallable = (try py.eval("5")).call() onerror recover try py.value(-1)
+			assert try notCallable.asInt() == -1
+			return none
+		}
+
+		@test()
+		def reports_script_errors() !none {
+			let py = try fresh()
+			let thrown = try failureOf(py, "def inner():\n    raise ValueError('boom')\ninner()\n")
+			assert thrown.kind == ScriptFailure.Thrown
+			assert thrown.message == "python: ValueError: boom"
+			assert thrown.trace.contains("Traceback (most recent call last)") && thrown.trace.contains("line 2, in inner")
+			let syntax = try failureOf(py, "x = +")
+			assert syntax.message.contains("SyntaxError")
+			let value = try failureOf(py, "raise KeyError(7)")
+			let payload = value.value
+			fail "no exception" when payload is none
+			assert try (try (try payload.get("args")).get(0)).asInt() == 7
+			let named = py.eval("1 / 0", "billing.py") onerror (err error) {
+				assert err.message == "python: ZeroDivisionError: divide by zero"
+				assert err is ScriptError && err.trace.contains("File \"billing.py\", line 1")
+				recover try py.value(none)
+			}
+			assert named.isNone()
+			let deep = try failureOf(py, "def down(n):\n    return down(n + 1)\ndown(0)\n")
+			assert deep.message.contains("RuntimeError: maximum recursion depth exceeded")
+			assert try (try py.eval("1")).asInt() == 1
+			return none
+		}
+
+		@test()
+		def scripts_call_host_functions() !none {
+			let py = try fresh()
+			let global = try py.global()
+			try global.set("add", try py.function(def (args Value[]) !Value {
+				return try py.value(try args[0].asInt() + try args[1].asInt())
+			}))
+			assert try (try py.eval("add(2, 3) * 2")).asInt() == 10
+			try global.set("count", try py.function(def (args Value[]) !Value {
+				return try py.value(args.len())
+			}))
+			assert try (try py.eval("count(1, 2, 3, 4, 5, 6, 7)")).asInt() == 7
+			assert try (try py.eval("count()")).asInt() == 0
+			try global.set("nothing", try py.function(def (_ Value[]) !Value {
+				return try py.value(none)
+			}))
+			assert try (try py.eval("nothing() is None")).asBool()
+			try global.set("twice", try py.function(def (args Value[]) !Value {
+				return try args[0].call(try args[0].call(1))
+			}))
+			assert try (try py.eval("twice(lambda n: n + 10)")).asInt() == 21
+			let keyword = try failureOf(py, "add(1, b=2)")
+			assert keyword.message.contains("TypeError")
+			return none
+		}
+
+		@test()
+		def host_errors_cross_the_script() !none {
+			let py = try fresh()
+			let global = try py.global()
+			try global.set("spend", try py.function(def (_ Value[]) !Value {
+				fail QuotaError{message: "over quota", code: "quota", used: 9}
+			}))
+			let used = 0
+			py.eval("spend()") onerror (err error) {
+				used = err.used when err is QuotaError
+				recover try py.value(none)
+			}
+			assert used == 9
+			try py.exec("try:\n    spend()\nexcept AdmError as e:\n    caught = str(e)\n")
+			assert try (try py.eval("caught")).asString() == "over quota"
+			try py.exec("def guarded():\n    try:\n        spend()\n    except Exception:\n        return False\n    return True\n")
+			assert !(try (try py.eval("guarded()")).asBool())
+			try global.set("rethrow", try py.function(def (args Value[]) !Value {
+				return try args[0].call()
+			}))
+			let message = ""
+			py.exec("def inner():\n    raise ValueError('inner')\nrethrow(inner)\n") onerror (err error) {
+				message = err.message
+				recover none
+			}
+			assert message == "python: ValueError: inner"
+			return none
+		}
+
+		@test()
+		def loads_modules() !none {
+			let py = try fresh()
+			py.define("shapes", "loads = 0\ndef area(w, h):\n    return w * h\nloads += 1\n")
+			let app = try py.load("app", "import shapes\nfrom shapes import area\nroom = area(3, 4)\nsame = __import__('shapes') is shapes\n")
+			assert app.kind() == Kind.Module
+			assert try (try app.get("room")).asInt() == 12
+			assert try (try app.get("same")).asBool()
+			assert try (try py.get("shapes", "loads")).asInt() == 1
+			assert (try py.load("app")).same(app)
+			py.define("geo.units", "INCH = 2.54\n")
+			py.define("geo", "from geo.units import INCH\nNAME = 'geo'\n")
+			assert try (try py.get("geo.units", "INCH")).asFloat() == 2.54
+			assert try (try py.get("geo", "NAME")).asString() == "geo"
+			try py.exec("import geo.units\nfrom geo import units\n")
+			assert try (try py.eval("units.INCH == geo.units.INCH")).asBool()
+			let missing = py.load("nope") onerror (err error) {
+				assert err.message.contains("ImportError")
+				recover app
+			}
+			assert missing.same(app)
+			py.define("broken", "ready = True\nraise ValueError('no')\n")
+			let first = py.load("broken") onerror recover app
+			assert first.same(app)
+			let second = py.load("broken") onerror (err error) {
+				assert err.message == "python: ValueError: no"
+				recover app
+			}
+			assert second.same(app)
+			assert try (try (try py.load("json")).invoke("dumps", [1, 2])).asString() == "[1, 2]"
+			assert try (try py.eval("__import__('re').match('a+', 'aab').group(0)")).asString() == "aa"
+			return none
+		}
+
+		@test()
+		def scripts_get_no_files() !none {
+			let py = try fresh()
+			let refused = try failureOf(py, "open('x')")
+			assert refused.message.contains("OSError")
+			let os = try failureOf(py, "import os")
+			assert os.message.contains("ImportError")
+			let clock = try failureOf(py, "import time")
+			assert clock.message.contains("ImportError")
+			assert try (try py.eval("eval('3 + 4')")).asInt() == 7
+			return none
+		}
+
+		@test()
+		def compiles_to_bytecode() !none {
+			let py = try fresh()
+			let script = try py.compile("total = 0\nfor i in range(1, 4):\n    total += i\n", "unit.py")
+			assert script.len() > 0 && script[0] == 77
+			let broken = py.compile("x = +") onerror recover byte[]
+			assert broken.len() == 0
+			try py.close()
+			let other = new Runtime()
+			try other.run(script)
+			assert try (try other.eval("total")).asInt() == 6
+			let garbage = other.run(byte[1, 2, 3]) onerror (err error) {
+				assert err is ScriptError && err.kind == ScriptFailure.Thrown
+				recover none
+			}
+			assert garbage is none
+			return none
+		}
+
+		@test()
+		def moves_bytes() !none {
+			let py = try fresh()
+			let raw = try py.bytes(byte[0, 255, 65])
+			assert raw.kind() == Kind.Bytes
+			assert (try raw.asBytes()).hex() == "00FF41"
+			assert try raw.len() == 3
+			assert (try (try py.eval("bytes([1, 0, 2])")).asBytes()).hex() == "010002"
+			assert (try (try py.eval("bytearray(b'ab')")).asBytes()).hex() == "6162"
+			assert try (try (try py.eval("len")).call(byte[1, 2, 3, 4])).asInt() == 4
+			assert try (try py.eval("'a\\x00b'")).len() == 3
+			return none
+		}
+
+		@test()
+		def scripts_hold_adm_objects() !none {
+			let py = try fresh()
+			let account = Account{owner: "Ada", balance: 1.0, labels: []}
+			let held = try py.foreign(account)
+			assert held.kind() == Kind.Foreign
+			let echo = try py.eval("lambda x: x")
+			let back = try echo.call(held)
+			let found = back.foreign()
+			fail "the object did not come back" when found is none
+			assert found is Account && found.owner == "Ada"
+			assert try (try (try py.eval("lambda x: type(x).__name__")).call(account)).asString() == "AdmObject"
+			assert (try py.eval("1")).foreign() is none
+			return none
+		}
+
+		@test()
+		def stops_runaway_scripts() !none {
+			let py = try fresh(timeout = 30ms)
+			let late = try failureOf(py, "while True:\n    pass\n")
+			assert late.kind == ScriptFailure.TimedOut
+			let caught = try failureOf(py, "while True:\n    try:\n        while True:\n            pass\n    except BaseException:\n        pass\n")
+			assert caught.kind == ScriptFailure.TimedOut
+			assert try (try py.eval("1")).asInt() == 1
+
+			py.timeout(0s)
+			let stopper = async interruptLater(py, 20ms)
+			let stopped = try failureOf(py, "while True:\n    pass\n")
+			await stopper
+			assert stopped.kind == ScriptFailure.Interrupted
+			assert try (try py.eval("2")).asInt() == 2
+			try py.close()
+
+			let small = new Runtime(memoryLimit = 2000000)
+			let full = try failureOf(small, "kept = []\nwhile True:\n    kept.append(bytearray(50000))\n")
+			assert full.kind == ScriptFailure.OutOfMemory
+			try small.exec("kept = None")
+			assert try (try small.eval("3")).asInt() == 3
+			return none
+		}
+
+		@test()
+		def runs_one_at_a_time() !none {
+			let py = try fresh()
+			let second = new Runtime()
+			let refused = second.eval("1") onerror (err error) {
+				assert err is ScriptError && err.kind == ScriptFailure.Closed
+				assert err.message.contains("one at a time")
+				recover try py.value(-1)
+			}
+			assert try refused.asInt() == -1
+			try py.close()
+			let third = new Runtime()
+			assert try (try third.eval("1")).asInt() == 1
+			return none
+		}
+
+		@test()
+		def closes() !none {
+			let py = try fresh()
+			let kept = try py.eval("\{'n': 1\}")
+			let global = try py.global()
+			try global.set("shut", try py.function(def (_ Value[]) !Value {
+				try py.close()
+				return try py.value(none)
+			}))
+			let inside = try failureOf(py, "shut()")
+			assert inside.kind == ScriptFailure.Closed
+			try py.close()
+			try py.close()
+			let after = py.eval("1") onerror (err error) {
+				assert err is ScriptError && err.kind == ScriptFailure.Closed
+				recover kept
+			}
+			assert after.same(kept)
+			let gone = kept.get("n") onerror recover kept
+			assert gone.same(kept)
+			assert py.memory() == 0
+			return none
+		}
+
+		@test()
+		def releases_what_it_drops() !none {
+			let py = try fresh()
+			let before = py.live()
+			for let i = 0; i < 1000; i++ {
+				let v = try py.value(i)
+				assert try v.asInt() == i
+			}
+			assert py.live() == before
+			let used = py.memory()
+			try py.exec("junk = [bytearray(1000) for _ in range(200)]\njunk = None\n")
+			py.collect()
+			assert py.memory() < used + 100000
+			try lendAccount(py)
+			py.collect()
+			py.collect()
+			assert py.engine.objects.len() == 0
+			return none
+		}
+
+		@test()
+		def tasks_share_a_runtime() !none {
+			let py = try fresh()
+			try py.exec("hits = 0\ndef spin(i):\n    global hits\n    hits += 1\n    return i\n")
+			let a = async hammer(py, 2000)
+			let b = async hammer(py, 2000)
+			let c = async hammer(py, 2000)
+			let total = (try await a) + (try await b) + (try await c)
+			assert total == 3 * 1999000
+			assert try (try py.eval("hits")).asInt() == 6000
+			return none
+		}
+
+		@test()
+		def runs_generators() !none {
+			let py = try fresh()
+			try py.exec("def numbers():\n    for i in range(1, 4):\n        yield i\n")
+			assert try (try py.eval("sum(numbers())")).asInt() == 6
+			let next = try py.eval("next")
+			let gen = try (try py.eval("numbers")).call()
+			assert try (try next.call(gen)).asInt() == 1
+			assert try (try next.call(gen)).asInt() == 2
+			return none
+		}
+	}
+}

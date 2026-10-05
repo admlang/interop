@@ -1,0 +1,859 @@
+internal partial module adm.interop.java.engine {
+	use (
+		adm.interop.java::*
+		adm.interop.java.jni::*
+		std.reflection
+		std.reflection::(FieldKind, FunctionMetaContext)
+	)
+
+	@env("JAVA_HOME")
+	const javaHome string
+
+	@env("PATH")
+	const searchPath string
+
+	@env("CLASSPATH")
+	const classPathVariable string
+
+	// The Java half of the library (bridge/Bridge.java, compiled), which
+	// the program defines in the VM it starts.
+	@embed("bridge/Bridge.class")
+	const bridgeClass byte[]
+
+	union Bits32 {
+		i uint32
+		f float32
+	}
+
+	union Bits64 {
+		i uint64
+		f float64
+	}
+
+	// In a packed string or array, the length that stands for null.
+	const absent = 0xffffffff
+
+	// The requests of the bridge, as Bridge.java numbers them.
+	const opBind = 1
+	const opCall = 2
+	const opLoad = 3
+	const opGet = 4
+	const opSet = 5
+	const opGetIndex = 6
+	const opSetIndex = 7
+	const opLength = 8
+	const opInvoke = 9
+	const opConstruct = 10
+	const opText = 11
+	const opSame = 12
+	const opEquals = 13
+	const opValue = 15
+	const opProxy = 16
+	const opForeign = 17
+	const opCollect = 18
+	const opStats = 19
+	const opDead = 20
+	const opElements = 21
+
+	def failed(kind ScriptFailure, message string) ScriptError {
+		let code = "conversion"
+		match kind {
+			case ScriptFailure.Thrown:
+				code = "thrown"
+			case ScriptFailure.Binding:
+				code = "binding"
+			case ScriptFailure.Unavailable:
+				code = "unavailable"
+			default:
+		}
+		return ScriptError{message: "java: {message}", code: code, kind: kind}
+	}
+
+	// The bytes of a blob, which is freed.
+	def blobBytes(blob uint) byte[] {
+		let data byte[]
+		let n = ajvmBlobSize(blob)
+		data.len(n)
+		ajvmBlobRead(blob, data, n) when n > 0
+		ajvmBlobFree(blob)
+		return data
+	}
+
+	// Machine is the process's Java VM, started once and never stopped,
+	// and what the program keeps on Java's behalf.
+	type Machine {
+		running   bool
+		// Host functions, errors travelling through Java and objects Java
+		// holds, by id, each with the number of holders: an ADM Value, or
+		// an object on the Java side.
+		functions map<int, HostFunction>
+		errors    map<int, error>
+		objects   map<int, any>
+		counts    map<int, int>
+		lastId    int
+		// Handles of values the program dropped; the next request frees
+		// them in Java.
+		released  int[]
+
+		// Starts the VM; `explicit` is a call to Runtime.start, which fails
+		// when the VM already runs, where any other use does not.
+		atomic def start(classPath string[], options string[], explicit bool) !none {
+			if running {
+				fail failed(ScriptFailure.Unavailable, "the Java VM already runs; a process starts it once, before the first use of Java") when explicit
+				return none
+			}
+			let found byte[]
+			found.len(4096)
+			let n = ajvmLocate(javaHome, searchPath, found, found.len())
+			fail failed(ScriptFailure.Unavailable, "no Java installation found: set JAVA_HOME or put `java` on PATH (install one with `sudo dnf install java-21-openjdk` or `sudo apt install default-jre`)") when n == 0
+			let folders = classPath
+			folders = classPathVariable.split(":") when folders.len() == 0 && classPathVariable != ""
+			folders = ["."] when folders.len() == 0
+			// -Xrs: the VM leaves the interrupt and termination signals to
+			// the program.
+			let all = ["-Djava.class.path={folders.join(":")}", "-Xrs"]
+			for let (_, o) in options {
+				all.push(o)
+			}
+			let packed byte[]
+			for let (_, o) in all {
+				for let (_, b) in o.bytes() {
+					packed.push(b)
+				}
+				packed.push(byte(0))
+			}
+			let why = ajvmStart(string(found[:n]), packed, all.len(), bridgeClass, bridgeClass.len())
+			fail failed(ScriptFailure.Unavailable, string(blobBytes(why))) when why != 0
+			running = true
+			return none
+		}
+
+		atomic def isRunning() bool {
+			return running
+		}
+
+		// Keeps a host function and returns its id, with one holder.
+		atomic def keepFunction(fn HostFunction) int {
+			lastId++
+			functions[lastId] = fn
+			counts[lastId] = 1
+			return lastId
+		}
+
+		// Keeps an error while Java carries it and returns its id.
+		atomic def keepError(err error) int {
+			lastId++
+			errors[lastId] = err
+			counts[lastId] = 1
+			return lastId
+		}
+
+		// Keeps an object while Java holds it and returns its id.
+		atomic def keepObject(obj any) int {
+			lastId++
+			objects[lastId] = obj
+			counts[lastId] = 1
+			return lastId
+		}
+
+		atomic def function(id int) ?HostFunction {
+			return functions.get(id)
+		}
+
+		atomic def keptError(id int) ?error {
+			return errors.get(id)
+		}
+
+		atomic def keptObject(id int) ?any {
+			return objects.get(id)
+		}
+
+		// One more holder of what is kept under id.
+		atomic def retain(id int) {
+			return unless counts.hasKey(id)
+			counts[id] = counts[id] + 1
+		}
+
+		// One holder less; the last one forgets what was kept.
+		atomic def drop(id int) {
+			return unless counts.hasKey(id)
+			let left = counts[id] - 1
+			if left > 0 {
+				counts[id] = left
+				return
+			}
+			counts.delete(id)
+			functions.delete(id)
+			errors.delete(id)
+			objects.delete(id)
+		}
+
+		// Notes that the program dropped the value with this handle.
+		atomic def release(handle int) {
+			released.push(handle)
+		}
+
+		// The handles dropped since the last call.
+		atomic def takeReleased() int[] {
+			let out = released
+			released = []
+			return out
+		}
+	}
+
+	let machine = new Machine()
+
+	// Starts the Java VM with its defaults unless it runs.
+	def ensure() !none {
+		return none when machine.isRunning()
+		try machine.start(string[], string[], false)
+		return none
+	}
+
+	// Reader walks the bytes of an answer.
+	type Reader {
+		data byte[]
+		at   int
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		def u8() int {
+			at++
+			return int(data[at - 1])
+		}
+
+		def u32() int {
+			at += 4
+			return get32(data, at - 4)
+		}
+
+		def i64() int {
+			at += 8
+			return get64(data, at - 8)
+		}
+
+		// A string; "" for an absent one.
+		def text() string {
+			let n = u32()
+			return "" when n == absent
+			at += n
+			return string(data[at - n:at])
+		}
+
+		// What is left.
+		def rest() byte[] {
+			return data[at:]
+		}
+	}
+
+	// Sends a request to the bridge and returns its answer. While Java
+	// runs it, Java may call functions of the program: this task runs them
+	// and goes on waiting. The handles the program dropped travel in front
+	// of the request.
+	def exchange(payload byte[]) !byte[] {
+		try ensure()
+		let gone = machine.takeReleased()
+		let head byte[]
+		put32(head, gone.len())
+		for let (_, handle) in gone {
+			put64(head, handle)
+		}
+		let out = int[0, 0, 0, 0]
+		let code = ajvmRequest(head, head.len(), payload, payload.len(), out)
+		for code == 1 {
+			let keep Value[]
+			let reply = hostCall(out[2], blobBytes(uint(out[0])), keep)
+			code = ajvmResume(uint(out[3]), uint(out[1]), reply, reply.len(), out)
+		}
+		return blobBytes(uint(out[0]))
+	}
+
+	// Sends a request and returns a reader over what it answered. Fails
+	// with what Java threw or refused: the ADM error a host function failed
+	// with when that is what Java let through, else a ScriptError.
+	def ask(payload byte[]) !Reader {
+		let r = new Reader(try exchange(payload))
+		let status = r.u8()
+		return r when status == 0
+		if status == 4 {
+			let id = r.i64()
+			let head = r.text()
+			let trace = r.text()
+			let thrown = readValue(r)
+			if id != 0 {
+				let original = machine.keptError(id)
+				fail original unless (original is none)
+			}
+			fail ScriptError{message: "java: {head}", code: "thrown", kind: ScriptFailure.Thrown, trace: trace, value: thrown}
+		}
+		fail failed(status == 5 ?? (ScriptFailure.Binding, ScriptFailure.Conversion), r.text())
+	}
+
+	// Reads a value as the bridge writes it.
+	def readValue(r Reader) Value {
+		let rt = runtime()
+		let code = r.u8()
+		match code {
+			case 1:
+				let v = new Value(rt, Kind.Bool)
+				v.bits = r.u8()
+				return v
+			case 2:
+				let v = new Value(rt, Kind.Integer)
+				v.bits = r.i64()
+				return v
+			case 3:
+				let v = new Value(rt, Kind.Float)
+				v.number = float(Bits64.i(uint64(r.i64())).f)
+				return v
+			case 4:
+				let v = new Value(rt, Kind.String)
+				v.chars = r.text()
+				return v
+			case 5:
+				let handle = r.i64()
+				let what = r.u8()
+				let made = Kind.Object
+				made = Kind.Class when what == 1
+				made = Kind.Array when what == 2
+				made = Kind.Foreign when what == 3
+				let v = new Value(rt, made)
+				v.handle = handle
+				v.bits = r.i64() when what == 3
+				return v
+			default:
+		}
+		return new Value(rt, Kind.Null)
+	}
+
+	// Writes a value as the bridge reads it. Fails when the value was
+	// released.
+	def writeValue(out byte[], v Value) !none {
+		match v.what {
+			case Kind.Null:
+				out.push(byte(0))
+			case Kind.Bool:
+				out.push(byte(1), byte(v.bits))
+			case Kind.Integer:
+				out.push(byte(2))
+				put64(out, v.bits)
+			case Kind.Float:
+				out.push(byte(3))
+				put64(out, int(Bits64.f(float64(v.number)).i))
+			case Kind.String:
+				out.push(byte(4))
+				putString(out, v.chars)
+			case Kind.Function:
+				fail failed(ScriptFailure.Conversion, "the function was released") when v.bits == 0
+				// Java hands this holder back when it drops the function.
+				machine.retain(v.bits)
+				out.push(byte(6))
+				put64(out, v.bits)
+			default:
+				fail failed(ScriptFailure.Conversion, "the value was released") when v.handle == 0
+				out.push(byte(5))
+				put64(out, v.handle)
+		}
+		return none
+	}
+
+	// Writes an ADM array as the Java array the bridge makes of it:
+	// byte[] and int8[] as byte[], int16[] as short[], int32[] as int[],
+	// int[] as long[], float32[] as float[], float[] as double[], bool[]
+	// as boolean[], string[] as String[], any other array as Object[] of
+	// its converted elements (see encode for `keep`). Returns false when v
+	// is not an array.
+	def encodeArray(out byte[], v any, keep Value[]) !bool {
+		return false unless reflection.kindOf(v) == FieldKind.Array
+		if reflection.typeName(v) == "byte[]" {
+			let a = byte[](v)
+			out.push(byte(7), byte(66))
+			put32(out, a.len())
+			ajvmPutBytes(out, room(out, a.len()), a, a.len())
+			return true
+		}
+		if v is int[] {
+			out.push(byte(7), byte(74))
+			put32(out, v.len())
+			ajvmPutInt64(out, room(out, v.len() * 8), v, v.len() * 8)
+			return true
+		}
+		if v is int32[] {
+			out.push(byte(7), byte(73))
+			put32(out, v.len())
+			ajvmPutInt32(out, room(out, v.len() * 4), v, v.len() * 4)
+			return true
+		}
+		if v is int16[] {
+			out.push(byte(7), byte(83))
+			put32(out, v.len())
+			ajvmPutInt16(out, room(out, v.len() * 2), v, v.len() * 2)
+			return true
+		}
+		if v is int8[] {
+			out.push(byte(7), byte(66))
+			put32(out, v.len())
+			ajvmPutInt8(out, room(out, v.len()), v, v.len())
+			return true
+		}
+		if v is float[] {
+			out.push(byte(7), byte(68))
+			put32(out, v.len())
+			ajvmPutFloat(out, room(out, v.len() * 8), v, v.len() * 8)
+			return true
+		}
+		if v is float32[] {
+			out.push(byte(7), byte(70))
+			put32(out, v.len())
+			ajvmPutFloat32(out, room(out, v.len() * 4), v, v.len() * 4)
+			return true
+		}
+		if v is bool[] {
+			out.push(byte(7), byte(90))
+			put32(out, v.len())
+			for let (_, e) in v {
+				out.push(byte(e ?? (1, 0)))
+			}
+			return true
+		}
+		if v is string[] {
+			out.push(byte(7), byte(84))
+			put32(out, v.len())
+			for let (_, e) in v {
+				putString(out, e)
+			}
+			return true
+		}
+		let items = reflection.elements(v)
+		out.push(byte(7), byte(79))
+		put32(out, items.len())
+		for let (_, e) in items {
+			try encode(out, e, keep)
+		}
+		return true
+	}
+
+	// Writes any ADM value as Runtime.value converts it; an array travels
+	// with the request instead of in one of its own. A value made on the
+	// way goes into `keep`, which the caller holds until Java has answered:
+	// dropping it sooner would release its object before Java reads it.
+	def encode(out byte[], v any, keep Value[]) !none {
+		return none when try encodeArray(out, v, keep)
+		let converted = try runtime().value(v)
+		keep.push(converted)
+		try writeValue(out, converted)
+		return none
+	}
+
+	// Runs host function fn for Java with the packed arguments and returns
+	// the packed answer: 0 and the result, 1 with the id of the ADM error
+	// it failed with and its message, or 2 with the Java exception it let
+	// through. What the answer refers to goes into `keep`, for the caller to
+	// hold until Java has read the answer.
+	def hostCall(fn int, packed byte[], keep Value[]) byte[] {
+		let out byte[]
+		let target = machine.function(fn)
+		if target is none {
+			out.push(byte(1))
+			put64(out, 0)
+			putString(out, "the ADM function was released")
+			return out
+		}
+		let r = new Reader(packed)
+		let n = r.u32()
+		let args Value[]
+		for let i = 0; i < n; i++ {
+			args.push(readValue(r))
+		}
+		let failure ?error = none
+		hostAnswer(out, target, args, keep) onerror (err error) {
+			failure = err
+			recover none
+		}
+		if !(failure is none) {
+			let bad byte[]
+			if failure is ScriptError {
+				let thrown = failure.value
+				if !(thrown is none) {
+					if thrown.handle != 0 {
+						keep.push(thrown)
+						bad.push(byte(2), byte(5))
+						put64(bad, thrown.handle)
+						return bad
+					}
+				}
+			}
+			bad.push(byte(1))
+			put64(bad, machine.keepError(failure))
+			putString(bad, failure.message)
+			return bad
+		}
+		return out
+	}
+
+	def hostAnswer(out byte[], fn HostFunction, args Value[], keep Value[]) !none {
+		let result = try fn(args)
+		keep.push(result)
+		let packed byte[]
+		try writeValue(packed, result)
+		out.push(byte(0))
+		for let (_, b) in packed {
+			out.push(b)
+		}
+		return none
+	}
+
+	// Forgets the functions, objects and errors Java no longer holds.
+	def reap() {
+		return unless machine.isRunning()
+		let ids = dead() onerror recover int[]
+		for let (_, id) in ids {
+			machine.drop(id)
+		}
+	}
+
+	def dead() !int[] {
+		let r = try ask(byte[opDead])
+		let out int[]
+		let n = r.u32()
+		for let i = 0; i < n; i++ {
+			out.push(r.i64())
+		}
+		return out
+	}
+
+	// Bound is a declaration bound to its Java method.
+	type Bound {
+		// The method's number in the bridge.
+		handle   int
+		// The Java method's name.
+		name     string
+		// The JNI type of each parameter, and the ADM type it is declared
+		// with.
+		params   string[]
+		declared string[]
+		// The same for the result; "V" and "" for none.
+		result   string
+		returns  string
+		optional bool
+	}
+
+	// The JNI type an ADM type crosses as. Fails for a type Java has no
+	// counterpart of.
+	def jniType(name string) !string {
+		let t = name
+		t = t["builtin.".len():] when t.startsWith("builtin.")
+		let array = t.endsWith("[]")
+		t = t[:t.len() - 2] when array
+		let out = ""
+		match t {
+			case "bool":
+				out = "Z"
+			case "int8", "byte", "uint8":
+				out = "B"
+			case "int16":
+				out = "S"
+			case "int32":
+				out = "I"
+			case "int", "int64":
+				out = "J"
+			case "float32":
+				out = "F"
+			case "float", "float64":
+				out = "D"
+			case "string":
+				out = "Ljava/lang/String;"
+			default:
+		}
+		fail failed(ScriptFailure.Binding, "a @java declaration cannot pass {name}: use bool, int8, int16, int32, int, float32, float, string or an array of one of them") when out == ""
+		return array ?? ("[{out}", out)
+	}
+
+	// The type name of a declaration's parameter or result without the
+	// `builtin.` prefix reflection gives it.
+	def plainName(name string) string {
+		return name["builtin.".len():] when name.startsWith("builtin.")
+		return name
+	}
+
+	// The Java method behind a declaration, looked up once and kept in the
+	// declaration's slot.
+	def bound(target FunctionMetaContext, className string, method string) !Bound {
+		let kept = target.slot()
+		return kept when kept is Bound
+		let d = target.descriptor
+		let b = new Bound()
+		for let p in d.signature.parameters {
+			let name = plainName(p.paramType.node.qualifiedName)
+			b.params.push(try jniType(name))
+			b.declared.push(name)
+		}
+		let result = d.signature.result.node.qualifiedName
+		result = result[1:] when result.startsWith("!")
+		b.optional = result.startsWith("?")
+		result = result[1:] when b.optional
+		result = plainName(result)
+		b.returns = result
+		b.result = "V"
+		b.result = try jniType(result) unless result := "" || "none"
+		b.name = method == "" ?? (d.node.name, method)
+		let out byte[]
+		out.push(byte(opBind))
+		putString(out, className)
+		putString(out, b.name)
+		putString(out, "({b.params.join("")}){b.result}")
+		b.handle = (try ask(out)).i64()
+		target.slot(b)
+		return b
+	}
+
+	def put32(out byte[], v int) {
+		out.push(byte(v & 0xff), byte((v >> 8) & 0xff), byte((v >> 16) & 0xff), byte((v >> 24) & 0xff))
+	}
+
+	def put64(out byte[], v int) {
+		out.push(byte(v & 0xff), byte((v >> 8) & 0xff), byte((v >> 16) & 0xff), byte((v >> 24) & 0xff), byte((v >> 32) & 0xff), byte((v >> 40) & 0xff), byte((v >> 48) & 0xff), byte((v >> 56) & 0xff))
+	}
+
+	// Makes room for n more bytes at the end of out and returns where
+	// they start.
+	def room(out byte[], n int) int {
+		let at = out.len()
+		out.len(at + n)
+		return at
+	}
+
+	def get32(data byte[], at int) int {
+		return int(data[at]) | (int(data[at + 1]) << 8) | (int(data[at + 2]) << 16) | (int(data[at + 3]) << 24)
+	}
+
+	def get64(data byte[], at int) int {
+		return get32(data, at) | (get32(data, at + 4) << 32)
+	}
+
+	def putString(out byte[], s string) {
+		let n = ajvmTextSize(s)
+		put32(out, n)
+		ajvmPutText(out, room(out, n), s, n)
+	}
+
+	// Packs one argument as its Java type expects it. `declared` is the
+	// ADM type of the parameter.
+	def pack(out byte[], declared string, a any) !none {
+		match declared {
+			case "bool":
+				put64(out, bool(a) ?? (1, 0))
+			case "int8":
+				put64(out, int(int8(a)))
+			case "byte", "uint8":
+				put64(out, int(byte(a)))
+			case "int16":
+				put64(out, int(int16(a)))
+			case "int32":
+				put64(out, int(int32(a)))
+			case "int":
+				put64(out, int(a))
+			case "int64":
+				put64(out, int(int64(a)))
+			case "float32":
+				put64(out, int(Bits32.f(float32(a)).i))
+			case "float":
+				put64(out, int(Bits64.f(float64(float(a))).i))
+			case "float64":
+				put64(out, int(Bits64.f(float64(a)).i))
+			case "string":
+				putString(out, string(a))
+			case "bool[]":
+				fail failed(ScriptFailure.Binding, "expected bool[]") unless a is bool[]
+				let v = a
+				put32(out, v.len())
+				for let (_, e) in v {
+					out.push(byte(e ?? (1, 0)))
+				}
+			case "byte[]", "uint8[]":
+				let v = byte[](a)
+				put32(out, v.len())
+				ajvmPutBytes(out, room(out, v.len()), v, v.len())
+			case "int8[]":
+				fail failed(ScriptFailure.Binding, "expected int8[]") unless a is int8[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutInt8(out, room(out, v.len()), v, v.len())
+			case "int16[]":
+				fail failed(ScriptFailure.Binding, "expected int16[]") unless a is int16[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutInt16(out, room(out, v.len() * 2), v, v.len() * 2)
+			case "int32[]":
+				fail failed(ScriptFailure.Binding, "expected int32[]") unless a is int32[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutInt32(out, room(out, v.len() * 4), v, v.len() * 4)
+			case "int[]":
+				fail failed(ScriptFailure.Binding, "expected int[]") unless a is int[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutInt64(out, room(out, v.len() * 8), v, v.len() * 8)
+			case "int64[]":
+				fail failed(ScriptFailure.Binding, "expected int64[]") unless a is int64[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutInt64s(out, room(out, v.len() * 8), v, v.len() * 8)
+			case "float32[]":
+				fail failed(ScriptFailure.Binding, "expected float32[]") unless a is float32[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutFloat32(out, room(out, v.len() * 4), v, v.len() * 4)
+			case "float[]":
+				fail failed(ScriptFailure.Binding, "expected float[]") unless a is float[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutFloat(out, room(out, v.len() * 8), v, v.len() * 8)
+			case "float64[]":
+				fail failed(ScriptFailure.Binding, "expected float64[]") unless a is float64[]
+				let v = a
+				put32(out, v.len())
+				ajvmPutFloat64(out, room(out, v.len() * 8), v, v.len() * 8)
+			case "string[]":
+				fail failed(ScriptFailure.Binding, "expected string[]") unless a is string[]
+				let v = a
+				put32(out, v.len())
+				for let (_, e) in v {
+					putString(out, e)
+				}
+			default:
+				fail failed(ScriptFailure.Binding, "a @java declaration cannot pass {declared}")
+		}
+		return none
+	}
+
+	// Calls the Java method behind a declaration and resolves the call.
+	def answer(target FunctionMetaContext, className string, method string) !none {
+		let b = try bound(target, className, method)
+		let packed byte[]
+		packed.push(byte(opCall))
+		put32(packed, b.handle)
+		for let (i, a) in target.args() {
+			try pack(packed, b.declared[i], a)
+		}
+		let r = try ask(packed)
+		let code = r.u8()
+		match code {
+			case 2:
+				settle(target, b, r.i64())
+			case 4:
+				target.resolve(r.text())
+			case 7:
+				r.u8()
+				let count = r.u32()
+				try unpack(target, b, r.data, r.at, count)
+			default:
+				fail failed(ScriptFailure.Conversion, "{b.name} returned null; declare its result ?{b.returns} to take that as none") unless b.optional || (b.returns := "" || "none")
+				target.resolve(none)
+		}
+		return none
+	}
+
+	// Resolves a call with the number Java returned, as the declared type.
+	def settle(target FunctionMetaContext, b Bound, bits int) {
+		match b.returns {
+			case "bool":
+				target.resolve(bits != 0)
+			case "int8":
+				target.resolve(int8(bits))
+			case "byte", "uint8":
+				target.resolve(byte(bits & 0xff))
+			case "int16":
+				target.resolve(int16(bits))
+			case "int32":
+				target.resolve(int32(bits))
+			case "int":
+				target.resolve(bits)
+			case "int64":
+				target.resolve(int64(bits))
+			case "float32":
+				target.resolve(Bits32.i(uint32(bits)).f)
+			case "float":
+				target.resolve(float(Bits64.i(uint64(bits)).f))
+			case "float64":
+				target.resolve(Bits64.i(uint64(bits)).f)
+			default:
+				target.resolve(none)
+		}
+	}
+
+	// Resolves a call with the array Java returned: its `count` elements
+	// start at `from` in `data`.
+	def unpack(target FunctionMetaContext, b Bound, data byte[], from int, count int) !none {
+		match b.returns {
+			case "bool[]":
+				let out bool[]
+				for let i = 0; i < count; i++ {
+					out.push(data[from + i] != 0)
+				}
+				target.resolve(out)
+			case "byte[]", "uint8[]":
+				target.resolve(data[from:])
+			case "int8[]":
+				let out int8[]
+				out.len(count)
+				ajvmTakeInt8(out, data, from, count)
+				target.resolve(out)
+			case "int16[]":
+				let out int16[]
+				out.len(count)
+				ajvmTakeInt16(out, data, from, count * 2)
+				target.resolve(out)
+			case "int32[]":
+				let out int32[]
+				out.len(count)
+				ajvmTakeInt32(out, data, from, count * 4)
+				target.resolve(out)
+			case "int[]":
+				let out int[]
+				out.len(count)
+				ajvmTakeInt64(out, data, from, count * 8)
+				target.resolve(out)
+			case "int64[]":
+				let out int64[]
+				out.len(count)
+				ajvmTakeInt64s(out, data, from, count * 8)
+				target.resolve(out)
+			case "float32[]":
+				let out float32[]
+				out.len(count)
+				ajvmTakeFloat32(out, data, from, count * 4)
+				target.resolve(out)
+			case "float[]":
+				let out float[]
+				out.len(count)
+				ajvmTakeFloat(out, data, from, count * 8)
+				target.resolve(out)
+			case "float64[]":
+				let out float64[]
+				out.len(count)
+				ajvmTakeFloat64(out, data, from, count * 8)
+				target.resolve(out)
+			case "string[]":
+				// Each string: a 32-bit length and its bytes; null as "".
+				let out string[]
+				let at = from
+				for let i = 0; i < count; i++ {
+					let n = get32(data, at)
+					at += 4
+					if n == absent {
+						out.push("")
+						continue
+					}
+					out.push(string(data[at:at + n]))
+					at += n
+				}
+				target.resolve(out)
+			default:
+				fail failed(ScriptFailure.Binding, "a @java declaration cannot return {b.returns}")
+		}
+		return none
+	}
+}

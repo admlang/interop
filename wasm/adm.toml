@@ -1,0 +1,10 @@
+# adm.toml
+#
+# The publisher section is missing: run `adm app init --publisher admlang` in
+# this folder before building the library for publication.
+
+schema = 1
+
+[publisher]
+pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
+repo_salt = "base64:Zjw1Z0CnnOouAHXd4Ti0IVAkhlJ/V26CazosMy9YfXQ="

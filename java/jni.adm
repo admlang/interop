@@ -1,0 +1,89 @@
+// The C side of adm.interop.java (jvm/adm_jvm.c): the Java VM on a thread
+// of its own, and the bridge class in it behind ajvmRequest. A blob is a
+// block of bytes the C side made and the caller reads and frees.
+@link("dl")
+internal module adm.interop.java.jni {
+	// Finds the Java VM library under javaHome, else beside the `java` on
+	// path; writes its path to `out` and returns its length, 0 for none.
+	def ajvmLocate(javaHome string, path string, out byte[], capacity int) int;
+
+	// Starts the process's Java VM from `libraryPath` with `count` options,
+	// each ending in a zero byte, and defines the bridge class in it.
+	// Returns 0, or a blob saying why it did not start.
+	def ajvmStart(libraryPath string, options byte[], count int, bridge byte[], bridgeSize int) uint;
+
+	// Hands a request, `head` followed by `data`, to the bridge and waits.
+	// Returns 0 with the answer as a blob in out[0], or 1 when Java calls a
+	// function of the program: its arguments are a blob in out[0], out[1]
+	// is the call, out[2] the function and out[3] the request, for
+	// ajvmResume.
+	def ajvmRequest(head byte[], headSize int, data byte[], size int, out int[]) int;
+
+	// Answers the call ajvmRequest returned and waits again, as it does.
+	def ajvmResume(request uint, call uint, reply byte[], size int, out int[]) int;
+
+	def ajvmBlobSize(blob uint) int;
+
+	def ajvmBlobRead(blob uint, out byte[], size int);
+
+	def ajvmBlobFree(blob uint);
+
+	// Copies `bytes` bytes of an array or a string into a request, at `at`.
+	@c(symbol = "ajvmPut")
+	def ajvmPutText(dst byte[], at int, src string, bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutBytes(dst byte[], at int, src byte[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutInt8(dst byte[], at int, src int8[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutInt16(dst byte[], at int, src int16[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutInt32(dst byte[], at int, src int32[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutInt64(dst byte[], at int, src int[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutInt64s(dst byte[], at int, src int64[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutFloat32(dst byte[], at int, src float32[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutFloat(dst byte[], at int, src float[], bytes int);
+
+	@c(symbol = "ajvmPut")
+	def ajvmPutFloat64(dst byte[], at int, src float64[], bytes int);
+
+	// Copies `bytes` bytes of an answer, from `at`, into an array.
+	@c(symbol = "ajvmTake")
+	def ajvmTakeInt8(dst int8[], src byte[], at int, bytes int);
+
+	@c(symbol = "ajvmTake")
+	def ajvmTakeInt16(dst int16[], src byte[], at int, bytes int);
+
+	@c(symbol = "ajvmTake")
+	def ajvmTakeInt32(dst int32[], src byte[], at int, bytes int);
+
+	@c(symbol = "ajvmTake")
+	def ajvmTakeInt64(dst int[], src byte[], at int, bytes int);
+
+	@c(symbol = "ajvmTake")
+	def ajvmTakeInt64s(dst int64[], src byte[], at int, bytes int);
+
+	@c(symbol = "ajvmTake")
+	def ajvmTakeFloat32(dst float32[], src byte[], at int, bytes int);
+
+	@c(symbol = "ajvmTake")
+	def ajvmTakeFloat(dst float[], src byte[], at int, bytes int);
+
+	@c(symbol = "ajvmTake")
+	def ajvmTakeFloat64(dst float64[], src byte[], at int, bytes int);
+
+	// The length of a string in bytes.
+	def ajvmTextSize(text string) int;
+}

@@ -1,0 +1,231 @@
+// The C side of adm.interop.python (adm_mpy.c): MicroPython behind functions
+// that take and return integers. `rt` is a runtime handle from ampyNew; a
+// value is a slot number with its kind in the top byte, 0 when the call
+// raised (the exception waits in ampyException).
+@link("m")
+internal module adm.interop.python.engine {
+	// Whether the program already has an open runtime.
+	def ampyBusy() bool;
+
+	// A new runtime, 0 when the program has one open; memoryLimit and
+	// stackSize in bytes, 0 for no limit and 1 MiB of stack. `host` runs
+	// host functions: (function id, argument count, first four arguments)
+	// to a slot, -1 for None, or 0 after ampyThrow.
+	def ampyNew(memoryLimit int, stackSize int, @callback host def(int, int, int, int, int, int) int) uint;
+
+	// Frees the Python side; the handle stays valid until ampyFree. False
+	// when called from inside a host function.
+	def ampyClose(rt uint) bool;
+
+	// Frees the handle.
+	def ampyFree(rt uint);
+
+	// Gives a slot back, from any task.
+	def ampyRelease(rt uint, value int);
+
+	// Slots in use.
+	def ampyLive(rt uint) int;
+
+	// Stops the running script, or the next one, from any task.
+	def ampyInterrupt(rt uint);
+
+	// Longest a call may run, in nanoseconds; 0 for no limit.
+	def ampyTimeout(rt uint, ns int);
+
+	// Why the last failed call was stopped: 0 not stopped, 1 interrupted,
+	// 2 timed out, 3 out of memory.
+	def ampyStopReason(rt uint) int;
+
+	// Bytes of the heap in use.
+	def ampyMemory(rt uint) int;
+
+	// Runs a full collection.
+	def ampyCollect(rt uint);
+
+	// The exception the last failed call put aside; 0 when there is none.
+	def ampyException(rt uint) int;
+
+	// Sets the exception the host function in progress raises when it
+	// returns 0: an AdmError with this message; a non-zero foreign id rides
+	// on it.
+	def ampyThrow(rt uint, message string, foreignId int);
+
+	// The same with a value, which must be an exception.
+	def ampyThrowValue(rt uint, value int);
+
+	// None.
+	def ampyNone(rt uint) int;
+
+	// A bool.
+	def ampyBool(rt uint, v bool) int;
+
+	// A float.
+	def ampyFloat(rt uint, v float) int;
+
+	// An int.
+	def ampyInt(rt uint, v int) int;
+
+	// A str.
+	def ampyString(rt uint, text string) int;
+
+	// A bytes object holding these bytes.
+	def ampyBytesOf(rt uint, data byte[], n int) int;
+
+	// An empty list.
+	def ampyList(rt uint) int;
+
+	// An empty dict.
+	def ampyDict(rt uint) int;
+
+	// A tuple of these values.
+	def ampyTuple(rt uint, items int[], n int) int;
+
+	// The module scripts run in, __main__.
+	def ampyGlobals(rt uint) int;
+
+	// A function that calls host function `fn`.
+	def ampyFunction(rt uint, fn int) int;
+
+	// An opaque object standing for the ADM object kept under `id`.
+	def ampyForeign(rt uint, id int) int;
+
+	// The id behind a foreign object, or behind the one an AdmError
+	// carries; 0 for any other value.
+	def ampyForeignId(rt uint, value int) int;
+
+	// Moves up to cap ids of collected foreign objects into out.
+	def ampyDead(rt uint, out int[], cap int) int;
+
+	// The arguments beyond the fourth of the host call in progress.
+	def ampyArgs(rt uint, out int[], cap int) int;
+
+	// Python's truth; false when the value's __bool__ raised.
+	def ampyToBool(rt uint, value int) bool;
+
+	// An int or a float as a float; 0 for anything else.
+	def ampyToFloat(rt uint, value int) float;
+
+	// Whether the value is an int that fits 64 bits.
+	def ampyIntFits(rt uint, value int) bool;
+
+	// An int that fits 64 bits; 0 for anything else.
+	def ampyToInt(rt uint, value int) int;
+
+	// str(value) in a blob; 0 when that raised.
+	def ampyText(rt uint, value int) uint;
+
+	// repr(value) in a blob; 0 when that raised.
+	def ampyRepr(rt uint, value int) uint;
+
+	// An exception as the last line of its traceback: "ValueError: bad".
+	def ampyErrorText(rt uint, value int) uint;
+
+	// An exception's traceback as Python prints it, in a blob.
+	def ampyTrace(rt uint, value int) uint;
+
+	// The bytes of a str, bytes or bytearray, in a blob; 0 for any other
+	// value.
+	def ampyBytes(rt uint, value int) uint;
+
+	// Bytes in a blob.
+	def ampyBlobLen(blob uint) int;
+
+	// Copies a blob into out and frees it.
+	def ampyBlobTake(blob uint, out byte[], cap int);
+
+	// value.name; 0 when that raised.
+	def ampyAttr(rt uint, value int, name string) int;
+
+	// value.name = v. False when the assignment raised.
+	def ampySetAttr(rt uint, value int, name string, v int) bool;
+
+	// del value.name.
+	def ampyDelAttr(rt uint, value int, name string) bool;
+
+	// hasattr(value, name): 1, 0, or -1 when looking it up raised.
+	def ampyHasAttr(rt uint, value int, name string) int;
+
+	// value[key]; 0 when that raised.
+	def ampyItem(rt uint, value int, key int) int;
+
+	// value[name].
+	def ampyKey(rt uint, value int, name string) int;
+
+	// value[index].
+	def ampyIndex(rt uint, value int, index int) int;
+
+	// value[key] = v. False when the assignment raised.
+	def ampySetItem(rt uint, value int, key int, v int) bool;
+
+	// value[name] = v.
+	def ampySetKey(rt uint, value int, name string, v int) bool;
+
+	// value[index] = v.
+	def ampySetIndex(rt uint, value int, index int, v int) bool;
+
+	// del value[key].
+	def ampyDelItem(rt uint, value int, key int) bool;
+
+	// del value[name].
+	def ampyDelKey(rt uint, value int, name string) bool;
+
+	// key in value: 1, 0, or -1 when the test raised.
+	def ampyContains(rt uint, value int, key int) int;
+
+	// name in value.
+	def ampyHasKey(rt uint, value int, name string) int;
+
+	// list.append(v). False when the value is not a list.
+	def ampyAppend(rt uint, value int, v int) bool;
+
+	// len(value); -1 when that raised.
+	def ampyLength(rt uint, value int) int;
+
+	// A dict's string keys in a blob, each a 4-byte little-endian length
+	// and its bytes; 0 when the value is not a dict.
+	def ampyKeys(rt uint, value int) uint;
+
+	// Copies the elements of a sequence into out as floats, up to cap, and
+	// returns how many; -1 when iterating raised or an element is not a
+	// number.
+	def ampyFloats(rt uint, value int, out float[], cap int) int;
+
+	// The same for integers: ints, or floats with no fraction.
+	def ampyInts(rt uint, value int, out int[], cap int) int;
+
+	// Whether both are the same object, as `is` compares.
+	def ampySame(rt uint, a int, b int) bool;
+
+	// a == b; false when comparing raised.
+	def ampyEqual(rt uint, a int, b int) bool;
+
+	// Calls fn with argc positional and kw keyword arguments: args holds
+	// the positional values, then a name and a value for each keyword.
+	// Returns the result; 0 when the call raised.
+	def ampyCall(rt uint, fn int, args int[], argc int, kw int) int;
+
+	// obj.name(args...).
+	def ampyInvoke(rt uint, obj int, name string, args int[], argc int, kw int) int;
+
+	// Evaluates an expression in __main__ and returns its value.
+	def ampyEval(rt uint, code string, name string) int;
+
+	// Runs statements in __main__. False when they raised.
+	def ampyExec(rt uint, code string, name string) bool;
+
+	// Makes a module's source available to import, without running it.
+	def ampyDefine(rt uint, name string, code string);
+
+	// The module `name`, run on first use.
+	def ampyImport(rt uint, name string) int;
+
+	// The module registered as `name`: on first use code runs as the file
+	// `file` and its globals become the module.
+	def ampyModule(rt uint, name string, file string, code string) int;
+
+	// Compiles source text to bytecode in a blob; 0 when it does not compile.
+	def ampyCompile(rt uint, code string, name string) uint;
+
+	// Runs bytecode from ampyCompile in __main__. False when it raised.
+	def ampyRun(rt uint, code byte[], n int) bool;
+}

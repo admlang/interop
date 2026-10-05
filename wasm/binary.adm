@@ -1,0 +1,155 @@
+internal partial module adm.interop.wasm.engine {
+	use (
+		adm.interop.wasm::*
+	)
+
+	// How an element or data segment is used.
+	enum SegmentMode {
+		// Copied into its table or memory when the module is instantiated.
+		Active,
+		// Kept for table.init or memory.init.
+		Passive,
+		// Only declares the functions ref.func may name.
+		Declarative
+	}
+
+	// The parameters and results of a function.
+	struct FunctionType {
+		params  ValueType[]
+		results ValueType[]
+	}
+
+	// The type of a global and whether it can be assigned.
+	struct GlobalType {
+		content ValueType
+		mutable bool
+	}
+
+	// Bytes [from, to) of the module's binary.
+	struct Span {
+		from int
+		to   int
+	}
+
+	// One import. `type` is set for a function, `table`, `memory` or
+	// `global` for the others.
+	struct Imported {
+		moduleName  string
+		name        string
+		// The two names as the binary spells them (see Exported.bytes).
+		moduleBytes Span
+		bytes       Span
+		kind        ExternKind
+		// Index of the function's type.
+		typeIndex   int
+		table       TableType
+		memory      Limits
+		global      GlobalType
+	}
+
+	// A global the module defines; init is its constant expression.
+	struct Global {
+		kind GlobalType
+		init Span
+	}
+
+	// One export: a function, table, memory or global under a name.
+	struct Exported {
+		name  string
+		// The name as the binary spells it. A name may contain U+0000, which
+		// a string cannot: `name` then stops before it.
+		bytes Span
+		kind  ExternKind
+		// Index in the function, table, memory or global index space.
+		index int
+	}
+
+	// An element segment: references for a table. Its elements are function
+	// indexes (functions) or constant expressions (expressions).
+	struct Element {
+		mode        SegmentMode
+		kind        ValueType
+		// For an active segment, the table and the expression of its offset.
+		table       int
+		offset      Span
+		functions   int[]
+		expressions Span[]
+	}
+
+	// A data segment: bytes for a memory.
+	struct Data {
+		mode   SegmentMode
+		// For an active segment, the memory and the expression of its offset.
+		memory int
+		offset Span
+		bytes  Span
+	}
+
+	// A run of locals of one type in a function body.
+	struct Locals {
+		count int
+		kind  ValueType
+	}
+
+	// The body of a function the module defines.
+	struct Body {
+		locals     Locals[]
+		localCount int
+		code       Span
+		// How many constant instructions the code has (numbers and references).
+		constants  int
+	}
+
+	// A custom section: bytes the format does not interpret, such as names.
+	struct CustomSection {
+		name  string
+		bytes Span
+	}
+
+	// Binary is a decoded WebAssembly module (Core 2.0, with 128-bit SIMD):
+	// its sections as the binary lists them. Function, table, memory and
+	// global indexes count the imports of that kind first.
+	type Binary {
+		// The binary the spans point into.
+		bytes        byte[]
+		types        FunctionType[]
+		imports      Imported[]
+		// The type index of each function the module defines.
+		functions    int[]
+		tables       TableType[]
+		memories     Limits[]
+		globals      Global[]
+		exports      Exported[]
+		// The start function's index; meaningful when hasStart is true.
+		start        int
+		hasStart     bool
+		elements     Element[]
+		// What the data count section says; meaningful when hasDataCount is true.
+		dataCount    int
+		hasDataCount bool
+		// The bodies of `functions`, in the same order.
+		bodies       Body[]
+		datas        Data[]
+		customs      CustomSection[]
+
+		// How many imports of this kind the module has.
+		def imported(kind ExternKind) int {
+			let n = 0
+			for let (_, i) in imports {
+				n++ when i.kind == kind
+			}
+			return n
+		}
+
+		// Checks the module against the validation rules: every index names
+		// something, limits and constant expressions are in order, and each
+		// function body uses its operands and labels with the right types.
+		// Fails with a ModuleError whose code is "invalid" at the first rule
+		// the module breaks.
+		def validate() !none {
+			let v = new Compiler(self)
+			try v.run()
+			return none
+		}
+	}
+}

@@ -1,0 +1,12 @@
+// WebAssembly as an ADM library, written in ADM.
+@manifest(version = "0.1.0")
+library adm.interop.wasm {
+	use (
+		adm.interop.wasm
+		adm.interop.wasm.engine
+	)
+
+	export (
+		adm.interop.wasm
+	)
+}

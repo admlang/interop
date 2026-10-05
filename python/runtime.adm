@@ -1,0 +1,573 @@
+partial module adm.interop.python {
+	use (
+		adm.interop.python.engine::*
+		std.reflection
+		std.reflection::(FieldKind)
+	)
+
+	// HostFunction is an ADM function a script calls. It gets the call's
+	// arguments and returns the result; an error it fails with is raised in
+	// the script as an AdmError, and comes back unchanged if the script lets
+	// it through.
+	type HostFunction = def(Value[]) !Value
+
+	// Engine is the state a Runtime and its values share: the MicroPython
+	// handle and what ADM keeps on the script's behalf.
+	internal type Engine {
+		// The runtime (adm_mpy.c), 0 when it could not be made.
+		handle     uint
+		// Whether it could not be made because the program has another open.
+		refused    bool
+		// Whether the runtime was closed.
+		closed     bool
+		weak owner ?Runtime
+		// The function C calls for every host function. It holds this engine,
+		// so close() drops it.
+		host       ?def(int, int, int, int, int, int) int
+		functions  HostFunction[]
+		// ADM errors travelling through the script, by foreign id.
+		errors     map<int, error>
+		// ADM objects the script holds, by foreign id.
+		objects    map<int, any>
+		lastId     int
+
+		def new(memoryLimit int, stackSize int) {
+			let me = self
+			let entry = def (fn int, argc int, a0 int, a1 int, a2 int, a3 int) int {
+				return me.dispatch(fn, argc, a0, a1, a2, a3)
+			}
+			host = entry
+			handle = ampyNew(memoryLimit, stackSize, entry)
+			refused = handle == 0 && ampyBusy()
+		}
+
+		def dispose() {
+			ampyFree(handle) unless handle == 0
+		}
+
+		// Runs host function fn for the script; see ampyNew.
+		def dispatch(fn int, argc int, a0 int, a1 int, a2 int, a3 int) int {
+			let rt = owner
+			if rt is none {
+				ampyThrow(handle, "the runtime was released", 0)
+				return 0
+			}
+			return hostCall(rt, fn, argc, a0, a1, a2, a3)
+		}
+
+		// Adds a host function and returns its id.
+		atomic def register(fn HostFunction) int {
+			functions.push(fn)
+			return functions.len() - 1
+		}
+
+		// The host function with this id.
+		atomic def function(id int) ?HostFunction {
+			return none when id < 0 || id >= functions.len()
+			return functions[id]
+		}
+
+		// Keeps an error while the script carries it and returns its id.
+		atomic def keepError(err error) int {
+			lastId++
+			errors[lastId] = err
+			return lastId
+		}
+
+		// The error kept under id.
+		atomic def keptError(id int) ?error {
+			return errors.get(id)
+		}
+
+		// Keeps an object while the script holds it and returns its id.
+		atomic def keepObject(obj any) int {
+			lastId++
+			objects[lastId] = obj
+			return lastId
+		}
+
+		// The object kept under id.
+		atomic def keptObject(id int) ?any {
+			return objects.get(id)
+		}
+
+		// Forgets what the script no longer holds.
+		atomic def forget(ids int[], n int) {
+			for let i = 0; i < n; i++ {
+				errors.delete(ids[i])
+				objects.delete(ids[i])
+			}
+		}
+
+		// Drops everything held for the script.
+		atomic def clear() {
+			host = none
+			functions = []
+			errors = errors.pickKeys(int[])
+			objects = objects.pickKeys(int[])
+		}
+	}
+
+	// Runtime is the program's Python interpreter (MicroPython): its heap,
+	// the `__main__` module and the modules scripts import. Scripts get
+	// MicroPython's builtins and the math, cmath, json, re, struct,
+	// collections, array, random, heapq, binascii, io, errno, gc and sys
+	// modules; no files, clock, process or sockets beyond what the program
+	// gives them as host functions.
+	//
+	//     let py = new Runtime()
+	//     let sum = try py.eval("1 + 2")
+	//     println(try sum.asInt())
+	//
+	// A program has one runtime open at a time: a second one made while the
+	// first is open fails every call with a ScriptError of kind Closed. Any
+	// task may use a runtime; calls run one at a time. A value belongs to
+	// the runtime that made it and keeps it alive.
+	type Runtime {
+		// Shared with this runtime's values.
+		engine Engine
+
+		// memoryLimit and stackSize are bytes, 0 for no memory limit and a
+		// 1 MiB stack; a script that needs more memory fails with a
+		// ScriptError of kind OutOfMemory. timeout bounds every call into
+		// the script, 0s for none.
+		def new(memoryLimit int = 0, stackSize int = 0, timeout duration = 0s) {
+			engine = new Engine(memoryLimit, stackSize)
+			engine.owner = self
+			ampyTimeout(engine.handle, int(timeout)) when engine.handle != 0 && timeout > 0s
+		}
+
+		def dispose() {
+			ampyClose(engine.handle) when engine.handle != 0
+			engine.closed = true
+			engine.clear()
+		}
+
+		// Frees the interpreter and everything the script holds. Values made
+		// by this runtime fail from here on, and the program may open
+		// another. Fails when called from a host function, which runs inside
+		// the script it would free.
+		def close() !none {
+			return none when engine.handle == 0
+			fail ScriptError{message: "python: close called from a host function", code: "closed", kind: ScriptFailure.Closed} unless ampyClose(engine.handle)
+			engine.closed = true
+			engine.clear()
+			return none
+		}
+
+		// Evaluates an expression in `__main__` and returns its value. name
+		// is what tracebacks call the code. Fails with a ScriptError when it
+		// does not compile or raises an exception.
+		def eval(expression string, name string = "<eval>") !Value {
+			return try wrap(self, ampyEval(engine.handle, expression, name))
+		}
+
+		// Runs statements in `__main__`: what they define stays there for
+		// later calls and for global(). Fails with a ScriptError when they
+		// do not compile or raise an exception.
+		def exec(code string, name string = "<exec>") !none {
+			try raise(self) unless engine.handle != 0 && ampyExec(engine.handle, code, name)
+			return none
+		}
+
+		// Makes a module's source available to `import` under name, without
+		// running it; a dotted name is a module of a package. A module runs
+		// once, when first imported or loaded.
+		def define(name string, source string) {
+			ampyDefine(engine.handle, name, source) unless engine.handle == 0
+		}
+
+		// Imports the module and returns it: one the program defined, or one
+		// of MicroPython's own ("math", "json"). A second load returns the
+		// same module. Fails with a ScriptError when there is no such
+		// module, or it does not compile or raises an exception.
+		def load(name string) !Value {
+			return try wrap(self, ampyImport(engine.handle, name))
+		}
+
+		// Defines the module and imports it.
+		// Fails with a ScriptError as load(name) does.
+		def load(name string, source string) !Value {
+			define(name, source)
+			return try load(name)
+		}
+
+		// An attribute of a module, importing the module when needed.
+		// Fails with a ScriptError as load(name) does, or when the module
+		// has no such attribute.
+		def get(moduleName string, name string) !Value {
+			let unit = try load(moduleName)
+			return try unit.attr(name)
+		}
+
+		// Compiles statements to MicroPython bytecode (the .mpy format) for
+		// run(). Fails with a ScriptError when the source does not compile.
+		def compile(source string, name string = "<exec>") !byte[] {
+			let blob = ampyCompile(engine.handle, source, name)
+			try raise(self) when blob == 0
+			return takeBlob(blob)
+		}
+
+		// Runs bytecode from compile() in `__main__`. The bytes must come
+		// from compile() of this library version: MicroPython checks their
+		// header, not the code, so anything else can crash the program.
+		// Fails with a ScriptError when the code raises an exception.
+		def run(bytecode byte[]) !none {
+			try raise(self) unless engine.handle != 0 && ampyRun(engine.handle, bytecode, bytecode.len())
+			return none
+		}
+
+		// The `__main__` module, where eval() and exec() run: its attributes
+		// are their globals.
+		// Fails with a ScriptError when the runtime is closed.
+		def global() !Value {
+			return try wrap(self, ampyGlobals(engine.handle))
+		}
+
+		// A bool.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v bool) !Value {
+			return try wrap(self, ampyBool(engine.handle, v))
+		}
+
+		// An int.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v int) !Value {
+			return try wrap(self, ampyInt(engine.handle, v))
+		}
+
+		// A float.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v float) !Value {
+			return try wrap(self, ampyFloat(engine.handle, v))
+		}
+
+		// A str.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v string) !Value {
+			return try wrap(self, ampyString(engine.handle, v))
+		}
+
+		// A bytes object holding these bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def bytes(v byte[]) !Value {
+			return try wrap(self, ampyBytesOf(engine.handle, v, v.len()))
+		}
+
+		// Converts an ADM value: a Value stays itself, none is None, numbers,
+		// bools and strings convert, byte[] becomes bytes, other arrays
+		// become lists and string-keyed maps dicts (copied, element by
+		// element). Anything else, a struct or a type object, crosses as a
+		// Foreign value the script can hold and pass back but not look into;
+		// copy() makes a dict of its fields instead.
+		// Fails with a ScriptError when the runtime is closed.
+		def value(v any) !Value {
+			return try nothing(self) when v is none
+			return v when v is Value
+			return try bytes(byte[](v)) when reflection.typeName(v) == "byte[]"
+			return try value(v) when v is string
+			return try value(v) when v is int
+			return try value(v) when v is float
+			return try value(v) when v is bool
+			match reflection.kindOf(v) {
+				case FieldKind.Bool:
+					return try value(reflection.scalarText(v) == "true")
+				case FieldKind.Int, FieldKind.Uint, FieldKind.Enum:
+					return try value(reflection.scalarText(v).toInt<int>())
+				case FieldKind.Float:
+					return try value(parseFloat<float>(reflection.scalarText(v)))
+				case FieldKind.String:
+					return try value(reflection.scalarText(v))
+				case FieldKind.Array:
+					let out = try list()
+					for let (_, e) in reflection.elements(v) {
+						try out.append(e)
+					}
+					return out
+				case FieldKind.Map:
+					let out = try dict()
+					for let key in reflection.keysOf(v) {
+						let e = reflection.entryOf(v, key)
+						try out.set(key, e) unless e is none
+					}
+					return out
+				default:
+					return try foreign(v) unless reflection.typeName(v) == "none"
+			}
+			return try nothing(self)
+		}
+
+		// A dict holding a copy of v's fields, by name, each converted as
+		// value() converts it except that nested structs are copied too.
+		// Arrays and maps are copied the same way; anything else converts as
+		// value() does.
+		// Fails with a ScriptError when the runtime is closed.
+		def copy(v any) !Value {
+			let kind = reflection.kindOf(v)
+			if kind == FieldKind.Array {
+				return try bytes(byte[](v)) when reflection.typeName(v) == "byte[]"
+				let out = try list()
+				for let (_, e) in reflection.elements(v) {
+					try out.append(try copy(e))
+				}
+				return out
+			}
+			if kind == FieldKind.Map {
+				let out = try dict()
+				for let key in reflection.keysOf(v) {
+					let e = reflection.entryOf(v, key)
+					try out.set(key, try copy(e)) unless e is none
+				}
+				return out
+			}
+			if kind == FieldKind.Struct {
+				let out = try dict()
+				for let (_, f) in reflection.fields(v) {
+					try out.set(f.name, try copyField(f))
+				}
+				return out
+			}
+			return try value(v)
+		}
+
+		// One field of a struct, as copy() copies it.
+		internal def copyField(f reflection.Field) !Value {
+			let kind = f.kind
+			if kind == FieldKind.Array {
+				if f.typeName == "byte[]" {
+					let raw byte[]
+					for let i = 0; i < f.len(); i++ {
+						raw.push(byte(f.at(i).asUint()))
+					}
+					return try bytes(raw)
+				}
+				let out = try list()
+				for let i = 0; i < f.len(); i++ {
+					try out.append(try copyPart(f.at(i), f.elemKind))
+				}
+				return out
+			}
+			if kind == FieldKind.Map {
+				let out = try dict()
+				for let key in f.keys() {
+					try out.set(key, try copyPart(f.entry(key), f.elemKind))
+				}
+				return out
+			}
+			return try copyPart(f, kind)
+		}
+
+		// A scalar or nested object addressed by f: a field, an array element
+		// or a map entry holding this kind.
+		internal def copyPart(f reflection.Field, kind FieldKind) !Value {
+			match kind {
+				case FieldKind.Bool:
+					return try value(f.asBool())
+				case FieldKind.Int, FieldKind.Enum:
+					return try value(f.asInt())
+				case FieldKind.Uint:
+					return try value(int(f.asUint()))
+				case FieldKind.Float:
+					return try value(f.asFloat())
+				case FieldKind.String:
+					return try value(f.asString())
+				default:
+					let inner = f.value()
+					return try nothing(self) when inner is none
+					return try copy(inner)
+			}
+			return try nothing(self)
+		}
+
+		// An empty list.
+		// Fails with a ScriptError when the runtime is closed.
+		def list() !Value {
+			return try wrap(self, ampyList(engine.handle))
+		}
+
+		// An empty dict.
+		// Fails with a ScriptError when the runtime is closed.
+		def dict() !Value {
+			return try wrap(self, ampyDict(engine.handle))
+		}
+
+		// A tuple of the items, each converted as value() converts it.
+		// Fails with a ScriptError when the runtime is closed.
+		def tuple(items ...any) !Value {
+			let held Value[]
+			let slots int[]
+			for let (_, item) in items {
+				let v = try value(item)
+				held.push(v)
+				slots.push(v.slot)
+			}
+			return try wrap(self, ampyTuple(engine.handle, slots, slots.len()))
+		}
+
+		// A function the script can call, running fn. It takes positional
+		// arguments only.
+		//
+		//     let add = try py.function((args) => py.value(try args[0].asInt() + try args[1].asInt()))
+		//     try (try py.global()).set("add", add)
+		// Fails with a ScriptError when the runtime is closed.
+		def function(fn HostFunction) !Value {
+			let id = engine.register(fn)
+			return try wrap(self, ampyFunction(engine.handle, id))
+		}
+
+		// An opaque object standing for obj. The script can hold it and pass
+		// it back (Value.foreign() returns obj) but not look into it. obj
+		// stays alive while the script holds the object.
+		// Fails with a ScriptError when the runtime is closed.
+		def foreign(obj any) !Value {
+			reap(self)
+			let id = engine.keepObject(obj)
+			return try wrap(self, ampyForeign(engine.handle, id))
+		}
+
+		// Stops the script that is running, or the next call if none is: it
+		// fails with a ScriptError of kind Interrupted. Callable from any
+		// task. A script is stopped where it loops, not inside a builtin
+		// such as sorted().
+		def interrupt() {
+			ampyInterrupt(engine.handle) unless engine.handle == 0
+		}
+
+		// Sets how long a call into the script may run, 0s for no limit. A
+		// call that runs longer fails with a ScriptError of kind TimedOut.
+		def timeout(limit duration) {
+			ampyTimeout(engine.handle, int(limit)) unless engine.handle == 0
+		}
+
+		// Bytes of the interpreter's heap in use.
+		def memory() int {
+			return engine.handle == 0 ?? (0, ampyMemory(engine.handle))
+		}
+
+		// Values of this runtime that ADM holds.
+		def live() int {
+			return engine.handle == 0 ?? (0, ampyLive(engine.handle))
+		}
+
+		// Runs a full garbage collection now.
+		def collect() {
+			ampyCollect(engine.handle) unless engine.handle == 0
+			reap(self)
+		}
+	}
+
+	// Python's None.
+	internal def nothing(rt Runtime) !Value {
+		return try wrap(rt, ampyNone(rt.engine.handle))
+	}
+
+	// Wraps a slot from C; fails with what the script raised when it is 0.
+	internal def wrap(rt Runtime, slot int) !Value {
+		try raise(rt) when slot == 0
+		return new Value(rt, slot)
+	}
+
+	// Fails with the error the last call put aside: the ADM error a host
+	// function failed with when that is what the script let through, else a
+	// ScriptError.
+	internal def raise(rt Runtime) !none {
+		let handle = rt.engine.handle
+		fail ScriptError{message: "python: the program already has a runtime open, and MicroPython runs one at a time", code: "closed", kind: ScriptFailure.Closed} when handle == 0 && rt.engine.refused
+		fail ScriptError{message: "python: the runtime could not be created", code: "closed", kind: ScriptFailure.Closed} when handle == 0
+		let stop = ampyStopReason(handle)
+		let slot = ampyException(handle)
+		fail ScriptError{message: "python: the script was interrupted", code: "interrupted", kind: ScriptFailure.Interrupted} when stop == 1
+		fail ScriptError{message: "python: the script ran longer than its timeout", code: "timeout", kind: ScriptFailure.TimedOut} when stop == 2
+		fail ScriptError{message: "python: the script ran out of memory", code: "memory", kind: ScriptFailure.OutOfMemory} when stop == 3
+		fail ScriptError{message: "python: the runtime is closed", code: "closed", kind: ScriptFailure.Closed} when slot == 0
+		let thrown = new Value(rt, slot)
+		let id = ampyForeignId(handle, slot)
+		if id != 0 {
+			let original = rt.engine.keptError(id)
+			fail original unless (original is none)
+		}
+		let message = string(takeBlob(ampyErrorText(handle, slot)))
+		let trace = string(takeBlob(ampyTrace(handle, slot)))
+		fail ScriptError{message: "python: {message}", code: "thrown", kind: ScriptFailure.Thrown, trace: trace, value: thrown}
+	}
+
+	// Runs host function fn for the script; see ampyNew.
+	internal def hostCall(rt Runtime, fn int, argc int, a0 int, a1 int, a2 int, a3 int) int {
+		let args Value[]
+		args.push(new Value(rt, a0)) when argc > 0
+		args.push(new Value(rt, a1)) when argc > 1
+		args.push(new Value(rt, a2)) when argc > 2
+		args.push(new Value(rt, a3)) when argc > 3
+		if argc > 4 {
+			let rest int[]
+			rest.len(argc - 4)
+			let n = ampyArgs(rt.engine.handle, rest, argc - 4)
+			for let i = 0; i < n; i++ {
+				args.push(new Value(rt, rest[i]))
+			}
+		}
+		let target = rt.engine.function(fn)
+		if target is none {
+			ampyThrow(rt.engine.handle, "the host function is gone", 0)
+			return 0
+		}
+		let failure ?error = none
+		let out = callHost(target, args) onerror (err error) {
+			failure = err
+			recover none
+		}
+		if !(failure is none) {
+			throwError(rt, failure)
+			return 0
+		}
+		return -1 when out is none
+		return out.slot
+	}
+
+	// Raises err in the script: the exception it carries when it is what a
+	// script raised here, else an AdmError that keeps err to fail with
+	// later.
+	internal def throwError(rt Runtime, err error) {
+		if err is ScriptError {
+			let thrown = err.value
+			if !(thrown is none) {
+				if thrown.runtime.engine.handle == rt.engine.handle {
+					ampyThrowValue(rt.engine.handle, thrown.slot)
+					return
+				}
+			}
+		}
+		reap(rt)
+		let id = rt.engine.keepError(err)
+		ampyThrow(rt.engine.handle, err.message, id)
+	}
+
+	// Forgets the errors and objects whose script-side object was
+	// collected.
+	internal def reap(rt Runtime) {
+		return when rt.engine.handle == 0
+		let ids int[]
+		ids.len(64)
+		for {
+			let n = ampyDead(rt.engine.handle, ids, 64)
+			rt.engine.forget(ids, n)
+			break when n < 64
+		}
+	}
+
+	// Calls a host function; none stands for a result that is None.
+	internal def callHost(fn HostFunction, args Value[]) !?Value {
+		let out = try fn(args)
+		return none when out.kind() == Kind.None
+		return out
+	}
+
+	// Copies a blob from C into ADM and frees it.
+	internal def takeBlob(blob uint) byte[] {
+		let n = ampyBlobLen(blob)
+		let out byte[]
+		out.len(n)
+		ampyBlobTake(blob, out, n)
+		return out
+	}
+}

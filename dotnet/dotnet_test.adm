@@ -1,0 +1,227 @@
+partial module adm.interop.dotnet {
+	use (
+		std.os
+		std.testing
+	)
+
+	// testdata/Sample.cs, built.
+	@embed("testdata/Sample.dll")
+	internal const sampleAssembly byte[]
+
+	internal let sampleStarted bool[]
+
+	// Puts Sample.dll in a folder of the program's own and starts the .NET
+	// runtime with that folder, once.
+	internal def sample() !none {
+		return none when sampleStarted.len() > 0
+		let folder = os.join(try os.appHome(), "assemblies")
+		os.mkdir(folder) onerror recover none
+		try os.writeFile(os.join(folder, "Sample.dll"), sampleAssembly)
+		try runtime().start(folders = [folder])
+		sampleStarted.push(true)
+		return none
+	}
+
+	@dotnet("Acme.Sample")
+	internal def add(a int32, b int32) !int32;
+
+	@dotnet("Acme.Sample, Sample")
+	internal def wide(a int, b int8, c int16) !int;
+
+	@dotnet("Acme.Sample")
+	internal def unsigned(a uint, b uint32, c uint16, d byte) !uint;
+
+	@dotnet("Acme.Sample")
+	internal def both(a bool, b bool) !bool;
+
+	@dotnet("Acme.Sample")
+	internal def half(v float, f float32) !float;
+
+	@dotnet("Acme.Sample")
+	internal def single(v float32) !float32;
+
+	@dotnet("Acme.Sample")
+	internal def greet(name string) !string;
+
+	@dotnet("Acme.Sample")
+	internal def length(text string) !int32;
+
+	@dotnet("Acme.Sample")
+	internal def nothing() !none;
+
+	@dotnet("Acme.Sample")
+	internal def missing(give bool) !?string;
+
+	// Sample.MissingText returns null where this declares a string.
+	@dotnet("Acme.Sample")
+	internal def missingText(give bool) !string;
+
+	@dotnet("Acme.Sample")
+	internal def sum(values float[]) !float;
+
+	@dotnet("Acme.Sample")
+	internal def squares(n int32) !int32[];
+
+	@dotnet("Acme.Sample")
+	internal def doubled(values int[]) !int[];
+
+	@dotnet("Acme.Sample")
+	internal def reversed(data byte[]) !byte[];
+
+	@dotnet("Acme.Sample")
+	internal def flipped(flags bool[]) !bool[];
+
+	@dotnet("Acme.Sample")
+	internal def words(v uint16[]) !uint16[];
+
+	@dotnet("Acme.Sample")
+	internal def scaled(v float32[], by float32) !float32[];
+
+	@dotnet("Acme.Sample")
+	internal def upper(words string[]) !string[];
+
+	@dotnet("Acme.Sample")
+	internal def joined(words string[], with string) !string;
+
+	// Sample.Refuse always throws.
+	@dotnet("Acme.Sample")
+	internal def refuse(message string) !int32;
+
+	@dotnet("Acme.Sample")
+	internal def fib(n int32) !int;
+
+	@dotnet("Acme.Sample")
+	internal def exact(v int32) !int32;
+
+	// The method under another name here.
+	@dotnet("Acme.Sample", method = "Add")
+	internal def plus(a int32, b int32) !int32;
+
+	// Sample.Add takes ints: no method takes two longs.
+	@dotnet("Acme.Sample", method = "Add")
+	internal def addWide(a int, b int) !int;
+
+	@dotnet("No.Such.Type")
+	internal def lost() !none;
+
+	check "Dotnet" {
+		@test()
+		def passes_numbers_and_booleans() !none {
+			try sample()
+			assert try add(2, 40) == 42
+			assert try plus(20, 22) == 42
+			assert try exact(41) == 42
+			assert try add(2147483647, 1) == -2147483648
+			assert try wide(1 << 40, -3, 300) == (1 << 40) + 297
+			assert try unsigned(1 << 63, 4000000000, 65535, 255) == (1 << 63) + 4000000000 + 65535 + 255
+			assert try both(a = true, b = true) && !(try both(a = true, b = false))
+			assert try half(5.0, 0.25) == 2.75
+			assert try single(1.5) == 2.25
+			try nothing()
+			assert try fib(20) == 6765
+			return none
+		}
+
+		@test()
+		def passes_strings() !none {
+			try sample()
+			assert try greet("ADM") == "hello, ADM"
+			// A character outside the basic plane is two UTF-16 units in
+			// .NET and four UTF-8 bytes here.
+			assert try greet("naïve 😀") == "hello, naïve 😀"
+			assert try length("a😀b") == 3
+			assert try joined(["a", "b", "c"], ", ") == "a, b, c"
+			return none
+		}
+
+		@test()
+		def passes_arrays_both_ways() !none {
+			try sample()
+			assert try sum([1.5, 2.5, 4.0]) == 8.0
+			assert (try squares(5)).str() == "[0, 1, 4, 9, 16]"
+			assert (try doubled(int[1, -2, 1 << 40])).str() == int[2, -4, 1 << 41].str()
+			assert (try reversed(byte[1, 2, 250])).str() == byte[250, 2, 1].str()
+			assert (try flipped([true, false, false])).str() == [false, true, true].str()
+			assert (try words(uint16[1, 65534])).str() == uint16[2, 65535].str()
+			assert (try scaled(float32[1.0, 2.5], 2.0)).str() == float32[2.0, 5.0].str()
+			assert (try upper(["one", "two"])).join("|") == "ONE|TWO"
+			assert (try squares(0)).len() == 0
+			return none
+		}
+
+		@test()
+		def takes_null_as_none() !none {
+			try sample()
+			let here = try missing(true)
+			assert !(here is none)
+			let gone = try missing(false)
+			assert gone is none
+			let message = ""
+			let code = ""
+			missingText(false) onerror (err error) {
+				message = err.message
+				code = err.code when err is ScriptError
+				recover ""
+			}
+			assert code == "conversion" && message == "dotnet: missingText returned null; declare its result ?string to take that as none"
+			return none
+		}
+
+		@test()
+		def reports_a_dotnet_exception() !none {
+			try sample()
+			let message = ""
+			let code = ""
+			let name = ""
+			let trace = ""
+			refuse("no stock") onerror (err error) {
+				message = err.message
+				if err is ScriptError {
+					code = err.code
+					trace = err.trace
+					let thrown = err.value
+					name = (thrown.invoke("GetType") onerror recover thrown).str() unless thrown is none
+				}
+				recover int32(0)
+			}
+			assert code == "thrown" && name == "System.InvalidOperationException"
+			assert message == "dotnet: System.InvalidOperationException: no stock"
+			assert trace.contains("at Acme.Sample.Refuse(")
+			// The runtime goes on working.
+			assert try add(1, 1) == 2
+			return none
+		}
+
+		@test()
+		def names_what_is_not_there() !none {
+			try sample()
+			let message = ""
+			let code = ""
+			addWide(3, 1) onerror (err error) {
+				message = err.message
+				code = err.code when err is ScriptError
+				recover 0
+			}
+			assert code == "binding" && message == "dotnet: type Acme.Sample has no method `static long Add(long, long)`"
+			message = ""
+			lost() onerror (err error) {
+				message = err.message
+				recover none
+			}
+			assert message == "dotnet: type No.Such.Type was not found in the assembly folders"
+			return none
+		}
+
+		@test()
+		def starts_once() !none {
+			try sample()
+			let code = ""
+			runtime().start(folders = ["elsewhere"]) onerror (err error) {
+				code = err.code when err is ScriptError
+				recover none
+			}
+			assert code == "unavailable"
+			return none
+		}
+	}
+}

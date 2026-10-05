@@ -1,0 +1,13 @@
+// .NET inside an ADM program: the installed .NET runtime, loaded at run time.
+@manifest(version = "0.1.0")
+library adm.interop.dotnet {
+	use (
+		adm.interop.dotnet
+		adm.interop.dotnet.engine
+		adm.interop.dotnet.host
+	)
+
+	export (
+		adm.interop.dotnet
+	)
+}

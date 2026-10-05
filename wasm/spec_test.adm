@@ -1,0 +1,382 @@
+internal partial module adm.interop.wasm.engine {
+	use (
+		adm.interop.wasm::*
+		std.bytes
+		std.data.compress.gzip
+		std.io
+		std.testing
+	)
+
+	// The WebAssembly 2.0 spec tests (testdata/pack.py), compressed.
+	@embed("testdata/spec-2.0.bin.gz")
+	const specPacked byte[]
+
+	// A value of a spec script: an argument, or what a result must be.
+	// forms and lanes have one entry for a scalar, one per lane for a v128.
+	struct SpecValue {
+		kind     int
+		// 0 to 3 as the value types, 7 for i8 lanes and 8 for i16 lanes.
+		laneKind int
+		// 0 the lane's bits, 1 a canonical NaN, 2 an arithmetic NaN, 3 null,
+		// 4 any reference that is not null.
+		forms    int[]
+		lanes    int[]
+	}
+
+	// One command of a spec script (the kinds are listed in testdata/pack.py).
+	struct SpecCommand {
+		kind     int
+		line     int
+		// A module's name, or the module an action addresses.
+		name     string
+		// The message the script expects, or the name a module is registered as.
+		text     string
+		binary   byte[]
+		// 0 invoke, 1 get.
+		action   int
+		field    byte[]
+		args     SpecValue[]
+		expected SpecValue[]
+	}
+
+	struct SpecScript {
+		name     string
+		commands SpecCommand[]
+	}
+
+	let specLoaded SpecScript[]
+
+	def specString(c Cursor) !byte[] {
+		let n = try c.fixed(4)
+		let s = try c.span(n)
+		return c.data[s.from:s.to]
+	}
+
+	def specValues(c Cursor) !SpecValue[] {
+		let values SpecValue[]
+		let count = try c.fixed(4)
+		for let i = 0; i < count; i++ {
+			let v = SpecValue{kind: try c.fixed(1)}
+			v.laneKind = try c.fixed(1)
+			let lanes = try c.fixed(1)
+			let width = 8
+			width = 4 when v.laneKind := 0 || 2
+			width = 1 when v.laneKind == 7
+			width = 2 when v.laneKind == 8
+			for let k = 0; k < lanes; k++ {
+				let form = try c.fixed(1)
+				v.forms.push(form)
+				v.lanes.push(form == 0 ?? (try c.fixed(width), 0))
+			}
+			values.push(v)
+		}
+		return values
+	}
+
+	def specAction(c Cursor, command SpecCommand) !none {
+		command.action = try c.fixed(1)
+		command.name = string(try specString(c))
+		command.field = try specString(c)
+		command.args = try specValues(c)
+		return none
+	}
+
+	def specParse() !SpecScript[] {
+		let data = try io.readAll(new gzip.Reader(new bytes.Reader(specPacked)))
+		let c = new Cursor(data, 0, data.len())
+		let scripts SpecScript[]
+		let count = try c.fixed(4)
+		for let i = 0; i < count; i++ {
+			let script = SpecScript{name: string(try specString(c))}
+			let commands = try c.fixed(4)
+			for let k = 0; k < commands; k++ {
+				let command = SpecCommand{kind: try c.fixed(1)}
+				command.line = try c.fixed(4)
+				match command.kind {
+					case 0:
+						command.name = string(try specString(c))
+						command.binary = try specString(c)
+					case 1:
+						command.name = string(try specString(c))
+						command.text = string(try specString(c))
+					case 2:
+						try specAction(c, command)
+					case 3:
+						try specAction(c, command)
+						command.expected = try specValues(c)
+					case 4, 5:
+						try specAction(c, command)
+						command.text = string(try specString(c))
+					case 6:
+						command.binary = try specString(c)
+					default:
+						command.binary = try specString(c)
+						command.text = string(try specString(c))
+				}
+				script.commands.push(command)
+			}
+			scripts.push(script)
+		}
+		return scripts
+	}
+
+	// The scripts of the spec tests, unpacked once.
+	def specScripts() SpecScript[] {
+		if specLoaded.len() == 0 {
+			let failed SpecScript[]
+			specLoaded = specParse() onerror recover failed
+		}
+		return specLoaded
+	}
+
+	// One module of the corpus: kind is 0 for a well-formed module, 1 for a
+	// malformed one and 2 for one validation must reject.
+	struct SpecModule {
+		kind   int
+		name   string
+		binary byte[]
+	}
+
+	// The binary modules the scripts name.
+	def specCorpus() SpecModule[] {
+		let all SpecModule[]
+		for let (_, script) in specScripts() {
+			for let (_, command) in script.commands {
+				let kind = -1
+				kind = 0 when command.kind := 0 || 8 || 9
+				kind = 1 when command.kind == 6
+				kind = 2 when command.kind == 7
+				all.push(SpecModule{kind: kind, name: "{script.name}:{command.line}", binary: command.binary}) when kind >= 0
+			}
+		}
+		return all
+	}
+
+	def specNoResults(_ Value[]) !Value[] {
+		let nothing Value[]
+		return nothing
+	}
+
+	// The bits of lane i of a v128, `width` bytes wide.
+	def specLane(v Value, i int, width int) int {
+		let at = i * width * 8
+		let half = at < 64 ?? (v.bits, v.high)
+		return half when width == 8
+		return (half >> (at & 63)) & ((1 << (width * 8)) - 1)
+	}
+
+	// Whether `bits`, a value of type `kind`, is what the script expects.
+	def specMatches(kind int, bits int, form int, want int) bool {
+		match form {
+			case 1:
+				return (bits & 0x7fffffff) == 0x7fc00000 when kind == 2
+				return (bits & maxInt) == 0x7ff8000000000000
+			case 2:
+				return (bits & 0x7fc00000) == 0x7fc00000 when kind == 2
+				return (bits & 0x7ff8000000000000) == 0x7ff8000000000000
+			case 3:
+				return bits == 0
+			case 4:
+				return bits != 0
+			default:
+		}
+		return (bits & 0xffffffff) == (want & 0xffffffff) when kind := 0 || 2
+		return (bits & 0xff) == want when kind == 7
+		return (bits & 0xffff) == want when kind == 8
+		// A host reference n is n + 1 in the store.
+		return bits == want + 1 when kind == 6
+		return bits == want
+	}
+
+	def specExpected(got Value, want SpecValue) bool {
+		return false unless got.kind.value == want.kind
+		return specMatches(want.kind, got.bits, want.forms[0], want.lanes[0]) unless want.kind == 4
+		let width = 16 / want.lanes.len()
+		for let i = 0; i < want.lanes.len(); i++ {
+			return false unless specMatches(want.laneKind, specLane(got, i, width), want.forms[i], want.lanes[i])
+		}
+		return true
+	}
+
+	def specArgument(v SpecValue) Value {
+		let out = Value{kind: ValueType(v.kind)}
+		if v.kind == 4 {
+			let width = 64 / v.lanes.len() * 2
+			for let i = 0; i < v.lanes.len(); i++ {
+				let at = i * width
+				if at < 64 {
+					out.bits |= v.lanes[i] << at
+				} else {
+					out.high |= v.lanes[i] << (at - 64)
+				}
+			}
+			return out
+		}
+		out.bits = v.lanes[0]
+		out.bits = v.forms[0] == 3 ?? (0, v.lanes[0] + 1) when v.kind >= 5
+		return out
+	}
+
+	// Runs one script in a store of its own, with the spectest module the
+	// scripts import from. Returns what went wrong, one line per command.
+	type SpecRun {
+		store    Machine
+		named    map<string, Linked>
+		current  Linked
+		problems string[]
+		passed   int
+		// The error of the last step: its message and its code.
+		message  string
+		code     string
+
+		def new() {
+			store = new Machine()
+			current = new Linked(store)
+			store.provide("spectest", "print", store.function(ValueType[], ValueType[], specNoResults))
+			store.provide("spectest", "print_i32", store.function(ValueType[ValueType.I32], ValueType[], specNoResults))
+			store.provide("spectest", "print_i64", store.function(ValueType[ValueType.I64], ValueType[], specNoResults))
+			store.provide("spectest", "print_f32", store.function(ValueType[ValueType.F32], ValueType[], specNoResults))
+			store.provide("spectest", "print_f64", store.function(ValueType[ValueType.F64], ValueType[], specNoResults))
+			store.provide("spectest", "print_i32_f32", store.function(ValueType[ValueType.I32, ValueType.F32], ValueType[], specNoResults))
+			store.provide("spectest", "print_f64_f64", store.function(ValueType[ValueType.F64, ValueType.F64], ValueType[], specNoResults))
+			store.provide("spectest", "global_i32", store.global(Value{kind: ValueType.I32, bits: 666}, false))
+			store.provide("spectest", "global_i64", store.global(Value{kind: ValueType.I64, bits: 666}, false))
+			store.provide("spectest", "global_f32", store.global(Value{kind: ValueType.F32, bits: 0x4426a666}, false))
+			store.provide("spectest", "global_f64", store.global(Value{kind: ValueType.F64, bits: 0x4084d4cccccccccd}, false))
+			store.provide("spectest", "table", store.table(TableType{element: ValueType.FuncRef, limits: Limits{min: 10, max: 20, bounded: true}}))
+			store.provide("spectest", "memory", store.memory(Limits{min: 1, max: 2, bounded: true}))
+		}
+
+		def note(err error) {
+			message = err.message
+			code = "error"
+			code = err.code when err is Trap
+			code = err.code when err is ModuleError
+		}
+
+		// Decodes and instantiates a module; code is "" when it worked.
+		def load(binary byte[]) Linked {
+			message = ""
+			code = ""
+			let m = decodeBinary(binary) onerror (err error) {
+				note(err)
+				recover new Binary()
+			}
+			return current unless code == ""
+			return store.instantiate(m) onerror (err error) {
+				note(err)
+				recover current
+			}
+		}
+
+		// Performs an action; code is "" when it worked.
+		def perform(command SpecCommand) Value[] {
+			message = ""
+			code = ""
+			let nothing Value[]
+			let instance = current
+			if command.name != "" {
+				if !named.hasKey(command.name) {
+					code = "error"
+					message = "no module named {command.name}"
+					return nothing
+				}
+				instance = named[command.name]
+			}
+			let key = command.field.hex()
+			if !instance.exports.hasKey(key) {
+				code = "error"
+				message = "no export {string(command.field)}"
+				return nothing
+			}
+			let e = instance.exports[key]
+			return Value[store.read(e)] when command.action == 1
+			let args Value[]
+			for let (_, v) in command.args {
+				args.push(specArgument(v))
+			}
+			return store.call(e.id, args) onerror (err error) {
+				note(err)
+				recover nothing
+			}
+		}
+
+		def run(script SpecScript) {
+			for let (_, command) in script.commands {
+				let place = "{script.name}:{command.line}"
+				let before = problems.len()
+				match command.kind {
+					case 0:
+						let instance = load(command.binary)
+						if code == "" {
+							current = instance
+							named[command.name] = instance when command.name != ""
+						} else {
+							problems.push("{place}: module: {message}")
+						}
+					case 1:
+						let instance = current
+						instance = named[command.name] when command.name != "" && named.hasKey(command.name)
+						store.register(command.text, instance)
+					case 2:
+						perform(command)
+						problems.push("{place}: action: {message}") unless code == ""
+					case 3:
+						let got = perform(command)
+						if code != "" {
+							problems.push("{place}: {message}")
+						} else if got.len() != command.expected.len() {
+							problems.push("{place}: {got.len()} results, expected {command.expected.len()}")
+						} else {
+							for let i = 0; i < got.len(); i++ {
+								continue when specExpected(got[i], command.expected[i])
+								problems.push("{place}: result {i} is {got[i].bits.hex()} {got[i].high.hex()}, expected {command.expected[i].lanes.str()} (forms {command.expected[i].forms.str()})")
+								break
+							}
+						}
+					case 4:
+						perform(command)
+						problems.push("{place}: expected the trap \"{command.text}\", got {code} {message}") unless code == "trap" && message.contains(command.text)
+					case 5:
+						perform(command)
+						problems.push("{place}: expected exhaustion, got {code} {message}") unless code == "exhausted"
+					case 6:
+						load(command.binary)
+						problems.push("{place}: expected a malformed module, got {code} {message}") unless code == "malformed"
+					case 7:
+						load(command.binary)
+						problems.push("{place}: expected an invalid module, got {code} {message}") unless code := "invalid" || "malformed"
+					case 8:
+						load(command.binary)
+						problems.push("{place}: expected \"{command.text}\", got {code} {message}") unless code == "unlinkable" && message.contains(command.text)
+					default:
+						load(command.binary)
+						problems.push("{place}: expected the trap \"{command.text}\", got {code} {message}") unless code == "trap" && message.contains(command.text)
+				}
+				passed++ when problems.len() == before
+			}
+		}
+	}
+
+	check "Spec" {
+		@test()
+		def runs_the_spec_scripts() {
+			let wrong string[]
+			let passed = 0
+			let total = 0
+			for let (_, script) in specScripts() {
+				let r = new SpecRun()
+				r.run(script)
+				passed += r.passed
+				total += script.commands.len()
+				println("{script.name}: {r.problems.len()} of {script.commands.len()} failed") unless r.problems.len() == 0
+				for let (_, p) in r.problems {
+					wrong.push(p) when wrong.len() < 60
+				}
+			}
+			println(wrong.join("\n")) unless wrong.len() == 0
+			println("{passed} of {total} commands passed")
+			assert wrong.len() == 0
+		}
+	}
+}

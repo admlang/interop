@@ -1,0 +1,43 @@
+partial module adm.interop.java {
+	use (
+		adm.interop.java.engine::*
+		std.reflection::(FunctionMetaContext)
+	)
+
+	internal let shared = new Runtime()
+
+	// The program's Java VM. It starts when it is first used, with the
+	// class path of the CLASSPATH variable or the current folder; call its
+	// start() before that to choose the class path and the VM's options.
+	def runtime() Runtime {
+		return shared
+	}
+
+	// Binds a function declared without a body to the static method of the
+	// same name in a Java class:
+	//
+	//     @java("com.acme.Billing")
+	//     def total(prices float[], quantity int32) !float;
+	//
+	// `method` names the Java method when it is not the declaration's name
+	// (`@java("Orders", method = "check") def checkOrder(...)`, for a name
+	// that is a keyword in ADM). The class is found on the VM's class path
+	// (see Runtime.start). The method is the one whose parameters are
+	// exactly the declaration's: bool is boolean, int8 byte, int16 short,
+	// int32 int, int long, float32 float, float double, string String, and
+	// an array of one of those the Java array (byte[] is byte[]). The
+	// result follows the same table; `?string` and `?T[]` take null as
+	// none. Arrays and strings are copied each way.
+	//
+	// A Java exception, a missing class or method, and a null where none is
+	// declared fail an errorable declaration with a ScriptError, and panic
+	// with its message when the declaration cannot fail.
+	meta def java(target FunctionMetaContext, className string, method string = "") {
+		let failure ?error = none
+		answer(target, className, method) onerror (err error) {
+			failure = err
+			recover none
+		}
+		target.reject(failure) unless failure is none
+	}
+}

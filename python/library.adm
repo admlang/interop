@@ -1,0 +1,12 @@
+// MicroPython as an ADM library: Python inside an ADM program.
+@manifest(version = "0.1.0")
+library adm.interop.python {
+	use (
+		adm.interop.python
+		adm.interop.python.engine
+	)
+
+	export (
+		adm.interop.python
+	)
+}

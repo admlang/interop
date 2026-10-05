@@ -1,0 +1,232 @@
+partial module adm.interop.dotnet {
+	use (
+		adm.interop.dotnet.engine::*
+		std.reflection
+		std.reflection::(FieldKind)
+	)
+
+	// HostFunction is an ADM function .NET calls. It gets the call's
+	// arguments and returns the result; an error it fails with is thrown in
+	// .NET as an exception, and comes back unchanged if the .NET code lets
+	// it through.
+	type HostFunction = def(Value[]) !Value
+
+	// Runtime is the .NET runtime of the program: the newest one of the
+	// .NET installation DOTNET_ROOT names, else of the `dotnet` on PATH
+	// (.NET 8 or later), loaded when it is first used. A process has one,
+	// for as long as it runs; every Runtime is that one, and runtime()
+	// gives it.
+	//
+	//     let dotnet = runtime()
+	//     let list = try (try dotnet.load("System.Collections.ArrayList")).construct()
+	//     try list.invoke("Add", "ADM")
+	//     println(try (try list.get("Count")).asInt())
+	//
+	// Any task may use it; calls into .NET run one at a time, on a thread
+	// the runtime owns. There is no source to evaluate: .NET code comes
+	// compiled, in assemblies.
+	type Runtime {
+		// Starts the runtime and names the folders its assemblies (.dll
+		// files) are loaded from. Without a call to start, the first use
+		// starts it with the current folder.
+		// Fails with a ScriptError of kind Unavailable when no .NET
+		// installation is found, when the runtime does not start, and when
+		// it already runs.
+		def start(folders string[] = []) !none {
+			try machine.start(folders, true)
+			return none
+		}
+
+		// A type as a value, by its name: "System.Text.StringBuilder" is
+		// looked for in the runtime's own library, the loaded assemblies
+		// and every assembly of the folders, "Acme.Billing, Billing" names
+		// its assembly, a generic type is spelled as .NET does
+		// ("System.Collections.Generic.List`1[System.Int32]"), and "int[]"
+		// and the other C# keywords name their types. invoke() calls its
+		// static methods, get() and set() reach its static fields and
+		// properties, construct() makes an instance.
+		// Fails with a ScriptError of kind Binding when the type is not
+		// found.
+		def load(typeName string) !Value {
+			let out byte[]
+			out.push(byte(opLoad))
+			putString(out, typeName)
+			return readValue(try ask(out))
+		}
+
+		// A static field or property of a type.
+		// Fails with a ScriptError as load() does, and when the type has
+		// no such member.
+		def get(typeName string, name string) !Value {
+			let found = try load(typeName)
+			return try found.get(name)
+		}
+
+		// .NET's null.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def null() !Value {
+			try machine.start(string[], false)
+			return new Value(self, Kind.Null)
+		}
+
+		// A boolean.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def value(v bool) !Value {
+			try machine.start(string[], false)
+			let out = new Value(self, Kind.Bool)
+			out.bits = v ?? (1, 0)
+			return out
+		}
+
+		// An integer: a long, or whichever integer type the method, field
+		// or property it is given to takes, when it fits.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def value(v int) !Value {
+			try machine.start(string[], false)
+			let out = new Value(self, Kind.Integer)
+			out.bits = v
+			return out
+		}
+
+		// A double, or a float where one is taken and the value survives.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def value(v float) !Value {
+			try machine.start(string[], false)
+			let out = new Value(self, Kind.Float)
+			out.number = v
+			return out
+		}
+
+		// A string.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def value(v string) !Value {
+			try machine.start(string[], false)
+			let out = new Value(self, Kind.String)
+			out.chars = v
+			return out
+		}
+
+		// A .NET byte[] holding a copy of these bytes.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def bytes(v byte[]) !Value {
+			return try value(v)
+		}
+
+		// Converts an ADM value: a Value stays itself, none is null,
+		// numbers, bools and strings convert, arrays become .NET arrays of
+		// the same element type (copied; int[] is a long[], float[] a
+		// double[], an array of anything else an object[]) and string-keyed
+		// maps a Dictionary<string, object>. Anything else, a struct or a
+		// type object, crosses as a Foreign value .NET can hold and pass
+		// back but not look into.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def value(v any) !Value {
+			return try null() when v is none
+			return v when v is Value
+			return try value(v) when v is string
+			return try value(v) when v is int
+			return try value(v) when v is float
+			return try value(v) when v is bool
+			match reflection.kindOf(v) {
+				case FieldKind.Bool:
+					return try value(reflection.scalarText(v) == "true")
+				case FieldKind.Int, FieldKind.Uint, FieldKind.Enum:
+					return try value(reflection.scalarText(v).toInt<int>())
+				case FieldKind.Float:
+					return try value(parseFloat<float>(reflection.scalarText(v)))
+				case FieldKind.String:
+					return try value(reflection.scalarText(v))
+				case FieldKind.Array:
+					let out byte[]
+					out.push(byte(opValue))
+					let keep Value[]
+					try encodeArray(out, v, keep)
+					return readValue(try ask(out))
+				case FieldKind.Map:
+					let made = try (try load("System.Collections.Generic.Dictionary`2[System.String,System.Object]")).construct()
+					for let key in reflection.keysOf(v) {
+						let e = reflection.entryOf(v, key)
+						try made.invoke("Add", key, e) unless e is none
+					}
+					return made
+				default:
+					return try foreign(v) unless reflection.typeName(v) == "none"
+			}
+			return try null()
+		}
+
+		// An ADM function for .NET. Without a type name it becomes, each
+		// time it is given to a method, a constructor, a field or a
+		// property, a delegate of the type that one takes, or an object of
+		// the interface it takes; with the name of a delegate type or an
+		// interface ("System.Action", "System.Func`2[System.Int32,System.Int32]",
+		// "System.IDisposable") it is that from the start. The delegate,
+		// and every method of the interface, runs fn with its arguments.
+		//
+		//     let byLength = try dotnet.function(def (args Value[]) !Value {
+		//         return try dotnet.value((try args[0].asString()).len() - (try args[1].asString()).len())
+		//     })
+		//     try list.invoke("Sort", byLength)
+		// Fails with a ScriptError when no .NET runtime can be started, and
+		// of kind Binding when the name is not a delegate type or an
+		// interface.
+		def function(fn HostFunction, typeName string = "") !Value {
+			try machine.start(string[], false)
+			reap()
+			let made = new Value(self, Kind.Function)
+			made.bits = machine.keepFunction(fn)
+			return made when typeName == ""
+			// The delegate or proxy holds the function from here on.
+			machine.retain(made.bits)
+			let out byte[]
+			out.push(byte(opProxy))
+			put64(out, made.bits)
+			putString(out, typeName)
+			return readValue(try ask(out))
+		}
+
+		// An opaque object standing for obj. .NET can hold it and pass it
+		// back (Value.foreign() returns obj) but not look into it. obj
+		// stays alive while .NET holds the object.
+		// Fails with a ScriptError when no .NET runtime can be started.
+		def foreign(obj any) !Value {
+			try machine.start(string[], false)
+			reap()
+			let out byte[]
+			out.push(byte(opForeign))
+			put64(out, machine.keepObject(obj))
+			return readValue(try ask(out))
+		}
+
+		// Bytes of the managed heap in use; 0 before the runtime starts.
+		def memory() int {
+			return stats(0)
+		}
+
+		// .NET objects the program holds through values.
+		def live() int {
+			return stats(1)
+		}
+
+		// Runs a garbage collection now, and forgets the ADM functions and
+		// objects .NET has dropped.
+		def collect() {
+			return unless machine.isRunning()
+			exchange(byte[opCollect]) onerror recover byte[]
+			reap()
+		}
+	}
+
+	// Entry `at` of what the bridge counts: heap bytes, held objects.
+	internal def stats(at int) int {
+		return 0 unless machine.isRunning()
+		let failed = false
+		let r = ask(byte[opStats]) onerror (err error) {
+			failed = true
+			recover new Reader(byte[])
+		}
+		return 0 when failed
+		let heap = r.i64()
+		return at == 0 ?? (heap, r.i64())
+	}
+}

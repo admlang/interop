@@ -1,0 +1,110 @@
+internal partial module adm.interop.wasm.engine {
+	use (
+		adm.interop.wasm::*
+		std.testing
+	)
+
+	// The header of a binary, then a type section with the type () -> ()
+	// and a function section with one function of it.
+	def oneFunction(code byte[]) byte[] {
+		let binary = byte[0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 4, 1, 0x60, 0, 0, 3, 2, 1, 0, 10]
+		binary.push(byte(code.len() + 4), 1, byte(code.len() + 2), 0)
+		for let (_, b) in code {
+			binary.push(b)
+		}
+		binary.push(0x0b)
+		return binary
+	}
+
+	// Why validation refuses a function () -> () with this code; "" when it
+	// accepts it.
+	def refusal(code byte[]) string {
+		let m = decodeBinary(oneFunction(code)) onerror (err error) {
+			recover new Binary()
+		}
+		let message = ""
+		m.validate() onerror (err error) {
+			message = err.message
+			recover none
+		}
+		return message
+	}
+
+	check "Validator" {
+		@test()
+		def judges_the_spec_modules() {
+			let valid = 0
+			let invalid = 0
+			let wrong string[]
+			for let (_, entry) in specCorpus() {
+				continue when entry.kind == 1
+				let decoded = true
+				let m = decodeBinary(entry.binary) onerror (err error) {
+					decoded = false
+					recover new Binary()
+				}
+				continue unless decoded
+				let failure = ""
+				m.validate() onerror (err error) {
+					failure = err.message
+					recover none
+				}
+				if entry.kind == 0 {
+					valid++
+					wrong.push("{entry.name}: {failure}") unless failure == ""
+				} else {
+					invalid++
+					wrong.push("{entry.name}: accepted an invalid module") when failure == ""
+				}
+			}
+			println(wrong[:wrong.len().min(40)].join("\n")) unless wrong.len() == 0
+			assert wrong.len() == 0
+			assert valid == 1716 && invalid == 2144
+		}
+
+		@test()
+		def accepts_well_typed_code() {
+			// i32.const 1, drop
+			assert refusal(byte[0x41, 1, 0x1a]) == ""
+			// block (result i32) i32.const 1, br 0, end, drop
+			assert refusal(byte[0x02, 0x7f, 0x41, 1, 0x0c, 0, 0x0b, 0x1a]) == ""
+			// unreachable, i32.add, drop: operands of unreachable code have any type
+			assert refusal(byte[0x00, 0x6a, 0x1a]) == ""
+		}
+
+		@test()
+		def names_what_is_invalid() {
+			// i32.const 1 left on the stack
+			assert refusal(byte[0x41, 1]) == "wasm: type mismatch: values remain on the stack at the end of a block at byte 25"
+			// i64.const 1, i32.eqz
+			assert refusal(byte[0x42, 1, 0x45, 0x1a]) == "wasm: type mismatch: expected i32, found i64 at byte 25"
+			// drop with nothing to drop
+			assert refusal(byte[0x1a]) == "wasm: type mismatch: the stack is empty at byte 23"
+			// br 1 from the function's body
+			assert refusal(byte[0x0c, 1]) == "wasm: unknown label 1 at byte 23"
+			// local.get 0 without locals
+			assert refusal(byte[0x20, 0, 0x1a]) == "wasm: unknown local 0 at byte 23"
+			// i32.const 0, i32.load without a memory
+			assert refusal(byte[0x41, 0, 0x28, 2, 0, 0x1a]) == "wasm: unknown memory 0 at byte 25"
+			// ref.func 0 that no segment, global or export declares
+			assert refusal(byte[0xd2, 0, 0x1a]) == "wasm: undeclared function reference: 0 at byte 23"
+		}
+
+		@test()
+		def reports_the_error_code() {
+			let m = decodeBinary(oneFunction(byte[0x1a])) onerror (err error) {
+				recover new Binary()
+			}
+			let code = ""
+			let offset = 0
+			m.validate() onerror (err error) {
+				if err is ModuleError {
+					code = err.code
+					offset = err.offset
+				}
+				recover none
+			}
+			assert code == "invalid" && offset == 23
+		}
+	}
+}

@@ -1,0 +1,229 @@
+partial module adm.interop.java {
+	use (
+		std.os
+		std.testing
+	)
+
+	// testdata/Sample.java, compiled.
+	@embed("testdata/Sample.class")
+	internal const sampleClass byte[]
+
+	internal let sampleStarted bool[]
+
+	// Puts Sample.class in the program's folder and starts the Java VM with
+	// that folder as its class path, once.
+	internal def sample() !none {
+		return none when sampleStarted.len() > 0
+		let folder = try os.appHome()
+		try os.writeFile(os.join(folder, "Sample.class"), sampleClass)
+		try runtime().start(classPath = [folder], options = ["-Dadm.test=yes", "-Xmx64m"])
+		sampleStarted.push(true)
+		return none
+	}
+
+	@java("Sample")
+	internal def add(a int32, b int32) !int32;
+
+	@java("Sample")
+	internal def wide(a int, b int8, c int16) !int;
+
+	@java("Sample")
+	internal def both(a bool, b bool) !bool;
+
+	@java("Sample")
+	internal def half(v float, f float32) !float;
+
+	@java("Sample")
+	internal def single(v float32) !float32;
+
+	@java("Sample")
+	internal def lowest(values int8[]) !int8;
+
+	@java("Sample")
+	internal def greet(name string) !string;
+
+	@java("Sample")
+	internal def length(text string) !int32;
+
+	@java("Sample")
+	internal def nothing() !none;
+
+	@java("Sample")
+	internal def missing(give bool) !?string;
+
+	@java("Sample")
+	internal def sum(values float[]) !float;
+
+	@java("Sample")
+	internal def squares(n int32) !int32[];
+
+	@java("Sample")
+	internal def doubled(values int[]) !int[];
+
+	@java("Sample")
+	internal def reversed(data byte[]) !byte[];
+
+	@java("Sample")
+	internal def flipped(flags bool[]) !bool[];
+
+	@java("Sample")
+	internal def shorts(v int16[]) !int16[];
+
+	@java("Sample")
+	internal def scaled(v float32[], by float32) !float32[];
+
+	@java("Sample")
+	internal def upper(words string[]) !string[];
+
+	@java("Sample")
+	internal def joined(words string[], with string) !string;
+
+	@java("Sample")
+	internal def property(name string) !?string;
+
+	// Sample.refuse always throws.
+	@java("Sample")
+	internal def refuse(message string) !int32;
+
+	// The Java method under another name here.
+	@java("Sample", method = "add")
+	internal def plus(a int32, b int32) !int32;
+
+	@java("Sample")
+	internal def fib(n int32) !int;
+
+	// Sample.add takes ints: no method takes two longs.
+	@java("Sample")
+	internal def subtract(a int, b int) !int;
+
+	@java("no.such.Class")
+	internal def lost() !none;
+
+	// Sample.missing returns null where this declares a string.
+	@java("Sample")
+	internal def missingText(give bool) !string;
+
+	check "Java" {
+		@test()
+		def passes_numbers_and_booleans() !none {
+			try sample()
+			assert try add(2, 40) == 42
+			assert try plus(20, 22) == 42
+			assert try add(2147483647, 1) == -2147483648
+			assert try wide(1 << 40, -3, 300) == (1 << 40) + 297
+			assert try both(a = true, b = true) && !(try both(a = true, b = false))
+			assert try half(5.0, 0.25) == 2.75
+			assert try single(1.5) == 2.25
+			assert try lowest(int8[5, -7, 3]) == -7
+			try nothing()
+			assert try fib(20) == 6765
+			return none
+		}
+
+		@test()
+		def passes_strings() !none {
+			try sample()
+			assert try greet("ADM") == "hello, ADM"
+			// A character outside the basic plane is two UTF-16 units in
+			// Java and four UTF-8 bytes here.
+			assert try greet("naïve 😀") == "hello, naïve 😀"
+			assert try length("a😀b") == 3
+			assert try joined(["a", "b", "c"], ", ") == "a, b, c"
+			return none
+		}
+
+		@test()
+		def passes_arrays_both_ways() !none {
+			try sample()
+			assert try sum([1.5, 2.5, 4.0]) == 8.0
+			assert (try squares(5)).str() == "[0, 1, 4, 9, 16]"
+			assert (try doubled(int[1, -2, 1 << 40])).str() == int[2, -4, 1 << 41].str()
+			assert (try reversed(byte[1, 2, 250])).str() == byte[250, 2, 1].str()
+			assert (try flipped([true, false, false])).str() == [false, true, true].str()
+			assert (try shorts(int16[1, -2, 300])).str() == int16[-1, 2, -300].str()
+			assert (try scaled(float32[1.0, 2.5], 2.0)).str() == float32[2.0, 5.0].str()
+			assert (try upper(["one", "two"])).join("|") == "ONE|TWO"
+			assert (try squares(0)).len() == 0
+			return none
+		}
+
+		@test()
+		def takes_null_as_none() !none {
+			try sample()
+			let here = try missing(true)
+			assert !(here is none)
+			let gone = try missing(false)
+			assert gone is none
+			let unknown = try property("adm.no.such.property")
+			assert unknown is none
+			let set = try property("adm.test")
+			assert !(set is none)
+			let message = ""
+			let code = ""
+			missingText(false) onerror (err error) {
+				message = err.message
+				code = err.code when err is ScriptError
+				recover ""
+			}
+			assert code == "conversion" && message == "java: missingText returned null; declare its result ?string to take that as none"
+			return none
+		}
+
+		@test()
+		def reports_a_java_exception() !none {
+			try sample()
+			let message = ""
+			let code = ""
+			let name = ""
+			let trace = ""
+			refuse("no stock") onerror (err error) {
+				message = err.message
+				if err is ScriptError {
+					code = err.code
+					trace = err.trace
+					let thrown = err.value
+					name = (thrown.invoke("getClass") onerror recover thrown).str() unless thrown is none
+				}
+				recover int32(0)
+			}
+			assert code == "thrown" && name == "class java.lang.IllegalStateException"
+			assert message == "java: java.lang.IllegalStateException: no stock"
+			assert trace.contains("at Sample.refuse(")
+			// The VM goes on working.
+			assert try add(1, 1) == 2
+			return none
+		}
+
+		@test()
+		def names_what_is_not_there() !none {
+			try sample()
+			let message = ""
+			let code = ""
+			subtract(3, 1) onerror (err error) {
+				message = err.message
+				code = err.code when err is ScriptError
+				recover 0
+			}
+			assert code == "binding" && message == "java: class Sample has no method `static long subtract(long, long)`"
+			message = ""
+			lost() onerror (err error) {
+				message = err.message
+				recover none
+			}
+			assert message == "java: class no.such.Class was not found on the class path"
+			return none
+		}
+
+		@test()
+		def starts_once() !none {
+			try sample()
+			let code = ""
+			runtime().start(classPath = ["elsewhere"]) onerror (err error) {
+				code = err.code when err is ScriptError
+				recover none
+			}
+			assert code == "unavailable"
+			return none
+		}
+	}
+}

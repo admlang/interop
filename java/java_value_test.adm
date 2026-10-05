@@ -1,0 +1,378 @@
+partial module adm.interop.java {
+	use (
+		adm.interop.java.engine::(machine)
+		std.errors
+		std.testing
+	)
+
+	internal struct StockError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		wanted  int
+	}
+
+	internal struct Parcel {
+		label  string
+		weight int
+	}
+
+	// What an error says when it is a ScriptError: its code, else "".
+	internal def codeOf(err error) string {
+		return err.code when err is ScriptError
+		return ""
+	}
+
+	check "JavaValues" {
+		@test()
+		def constructs_and_invokes() !none {
+			try sample()
+			let java = runtime()
+			let list = try (try java.load("java.util.ArrayList")).construct()
+			assert list.kind() == Kind.Object
+			try list.invoke("add", "ADM")
+			try list.invoke("add", 42)
+			assert try (try list.invoke("size")).asInt() == 2
+			assert try list.len() == 2
+			assert try (try list.get(0)).asString() == "ADM"
+			assert try (try list.get(1)).asInt() == 42
+			try list.set(1, 2.5)
+			assert try (try list.get(1)).asFloat() == 2.5
+			assert try list.text() == "[ADM, 2.5]"
+			assert "{list}" == "[ADM, 2.5]"
+			let builder = try (try java.load("java.lang.StringBuilder")).construct("a")
+			try builder.invoke("append", 42)
+			try builder.invoke("append", true)
+			try builder.invoke("append", 1.5)
+			assert try builder.text() == "a42true1.5"
+			// A static method, a method of the class object itself, and a
+			// nested class by its dotted name.
+			let math = try java.load("java.lang.Math")
+			assert math.kind() == Kind.Class
+			assert try (try math.invoke("max", 3, 9)).asInt() == 9
+			assert try (try math.invoke("getName")).asString() == "java.lang.Math"
+			let entry = try java.load("java.util.AbstractMap.SimpleEntry")
+			let pair = try entry.construct("k", 7)
+			assert try (try pair.invoke("getValue")).asInt() == 7
+			// A method of a class that is not public, through its interface.
+			let fixed = try (try java.load("java.util.Collections")).invoke("unmodifiableList", list)
+			assert try (try fixed.invoke("size")).asInt() == 2
+			// Methods of a string and of a number.
+			let word = try java.value("adm")
+			assert try (try word.invoke("toUpperCase")).asString() == "ADM"
+			assert try word.len() == 3
+			// Two objects that are equal without being the same one.
+			let other = try (try java.load("java.util.ArrayList")).construct(list)
+			assert try other.equals(list)
+			assert !other.same(list) && list.same(list)
+			assert !(try other.equals(word))
+			assert (try java.value(7)).same(try java.value(7))
+			return none
+		}
+
+		@test()
+		def converts_values() !none {
+			try sample()
+			let java = runtime()
+			let s = try java.load("Sample")
+			assert try (try s.invoke("typeOf", 5)).asString() == "java.lang.Integer"
+			assert try (try s.invoke("typeOf", 5000000000)).asString() == "java.lang.Long"
+			assert try (try s.invoke("typeOf", 1.5)).asString() == "java.lang.Double"
+			assert try (try s.invoke("typeOf", true)).asString() == "java.lang.Boolean"
+			assert try (try s.invoke("typeOf", "x")).asString() == "java.lang.String"
+			assert try (try s.invoke("typeOf", none)).asString() == "null"
+			assert try (try s.invoke("typeOf", int[1, 2])).asString() == "[J"
+			assert try (try s.invoke("typeOf", int32[1, 2])).asString() == "[I"
+			assert try (try s.invoke("typeOf", [1.5])).asString() == "[D"
+			assert try (try s.invoke("typeOf", ["a"])).asString() == "[Ljava.lang.String;"
+			assert try (try s.invoke("typeOf", [true])).asString() == "[Z"
+			assert try (try s.invoke("typeOf", byte[1, 2])).asString() == "[B"
+			assert (try s.invoke("echo", none)).isNone()
+			assert try (try s.invoke("echo", -3)).asInt() == -3
+			assert try (try s.invoke("echo", 0.25)).asFloat() == 0.25
+			assert try (try s.invoke("echo", 4)).asFloat() == 4.0
+			assert try (try s.invoke("echo", 4.0)).asInt() == 4
+			assert try (try s.invoke("echo", false)).asBool() == false
+			assert try (try s.invoke("echo", "naïve 😀")).asString() == "naïve 😀"
+			// A float goes where a Java float is taken only when it survives.
+			assert try (try s.invoke("narrow", 0.5)).asFloat() == 0.5
+			let code = ""
+			s.invoke("narrow", 0.1) onerror (err error) {
+				code = codeOf(err)
+				recover try java.null()
+			}
+			assert code == "binding"
+			let raw = try java.bytes(byte[1, 2, 250])
+			assert raw.kind() == Kind.Array
+			assert (try raw.asBytes()).hex() == "0102FA"
+			assert (try (try s.invoke("reversed", raw)).asBytes()).hex() == "FA0201"
+			let nested = try java.value([[1, 2], [3]])
+			assert try (try s.invoke("typeOf", nested)).asString() == "[Ljava.lang.Object;"
+			assert try (try (try nested.get(1)).get(0)).asInt() == 3
+			let ages = try java.value({"ada": 36, "alan": 41})
+			assert try (try ages.invoke("get", "alan")).asInt() == 41
+			assert try ages.len() == 2
+			code = ""
+			(try java.value("text")).asInt() onerror (err error) {
+				code = codeOf(err)
+				recover 0
+			}
+			assert code == "conversion"
+			return none
+		}
+
+		@test()
+		def reads_and_writes_fields() !none {
+			try sample()
+			let java = runtime()
+			assert try (try java.get("Sample", "total")).asInt() == 7
+			let s = try java.load("Sample")
+			try s.set("total", 9)
+			assert try (try s.get("total")).asInt() == 9
+			try s.set("total", 7)
+			let one = try s.construct("box", 3)
+			assert try (try one.get("label")).asString() == "box"
+			assert try (try one.invoke("bump", 4)).asInt() == 7
+			assert try (try one.get("count")).asInt() == 7
+			try one.set("label", none)
+			assert (try one.get("label")).isNone()
+			let numbers = try (try java.load("int[]")).construct(3)
+			try numbers.set(2, 11)
+			assert try (try numbers.get(2)).asInt() == 11
+			assert try (try numbers.get("length")).asInt() == 3
+			assert try numbers.len() == 3
+			let message = ""
+			one.get("weight") onerror (err error) {
+				message = err.message
+				recover try java.null()
+			}
+			assert message == "java: a Sample has no field weight"
+			message = ""
+			one.set("count", "many") onerror (err error) {
+				message = "{codeOf(err)}: {err.message}"
+				recover none
+			}
+			assert message == "conversion: java: field count of a Sample is a int, which cannot take a string"
+			message = ""
+			numbers.get(3) onerror (err error) {
+				message = err.message
+				recover try java.null()
+			}
+			assert message == "java: index 3 is outside 0..2"
+			return none
+		}
+
+		@test()
+		def picks_the_overload_that_fits() !none {
+			try sample()
+			let java = runtime()
+			let s = try java.load("Sample")
+			let one = try s.construct()
+			assert try (try one.invoke("describe", 1)).asString() == "long 1"
+			assert try (try one.invoke("describe", 1.5)).asString() == "double 1.5"
+			assert try (try one.invoke("describe", "x")).asString() == "string x"
+			assert try (try one.invoke("describe", true)).asString() == "object true"
+			assert try (try one.invoke("describe", none)).asString() == "string null"
+			assert try (try s.invoke("joinAll", "-", 1, "b", 2.5)).asString() == "1-b-2.5"
+			assert try (try s.invoke("joinAll", "-")).asString() == ""
+			let message = ""
+			let code = ""
+			one.invoke("bump", "far") onerror (err error) {
+				message = err.message
+				code = codeOf(err)
+				recover try java.null()
+			}
+			assert code == "binding" && message == "java: Sample has no method bump that takes (a string)"
+			message = ""
+			one.invoke("vanish") onerror (err error) {
+				message = err.message
+				recover try java.null()
+			}
+			assert message == "java: Sample has no method vanish"
+			message = ""
+			s.construct(1, 2, 3) onerror (err error) {
+				message = err.message
+				recover try java.null()
+			}
+			assert message == "java: class Sample has no public constructor that takes (an integer, an integer, an integer)"
+			message = ""
+			java.load("no.such.Class") onerror (err error) {
+				message = err.message
+				recover try java.null()
+			}
+			assert message == "java: class no.such.Class was not found on the class path"
+			return none
+		}
+
+		@test()
+		def java_calls_adm_functions() !none {
+			try sample()
+			let java = runtime()
+			let s = try java.load("Sample")
+			let shout = try java.function(def (args Value[]) !Value {
+				return try java.value("{try args[0].asString()}!")
+			})
+			assert shout.kind() == Kind.Function
+			assert try (try s.invoke("apply", shout, "hey")).asString() == "hey!"
+			let double = try java.function(def (args Value[]) !Value {
+				return try java.value(2 * try args[0].asInt())
+			})
+			assert try (try s.invoke("twice", double, 5)).asInt() == 20
+			// An object of a named interface from the start.
+			let supplier = try java.function(def (args Value[]) !Value {
+				return try java.value("made")
+			}, "java.util.function.Supplier")
+			assert supplier.kind() == Kind.Object
+			assert try (try supplier.invoke("get")).asString() == "made"
+			assert try (try supplier.invoke("toString")).asString() != ""
+			// A function that calls back into Java while Java waits for it.
+			let nested = try java.function(def (args Value[]) !Value {
+				return try s.invoke("apply", shout, try args[0].asString())
+			})
+			assert try (try s.invoke("apply", nested, "deep")).asString() == "deep!"
+			// A call from a thread Java started.
+			assert try (try s.invoke("later", try java.function(def (args Value[]) !Value {
+				return try java.value(99)
+			}))).asInt() == 99
+			let sorted = try (try java.load("java.util.ArrayList")).construct()
+			try sorted.invoke("add", "ccc")
+			try sorted.invoke("add", "a")
+			try sorted.invoke("add", "bb")
+			try sorted.invoke("sort", try java.function(def (args Value[]) !Value {
+				return try java.value((try args[0].asString()).len() - (try args[1].asString()).len())
+			}))
+			assert try sorted.text() == "[a, bb, ccc]"
+			let message = ""
+			java.function(shout_unused, "java.lang.String") onerror (err error) {
+				message = err.message
+				recover try java.null()
+			}
+			assert message == "java: java.lang.String is not an interface: an ADM function stands in for an interface"
+			return none
+		}
+
+		@test()
+		def errors_cross_both_ways() !none {
+			try sample()
+			let java = runtime()
+			let s = try java.load("Sample")
+			// What Java throws, as a value.
+			let message = ""
+			let trace = ""
+			let reason = ""
+			s.invoke("refuse", "no stock") onerror (err error) {
+				message = err.message
+				if err is ScriptError {
+					trace = err.trace
+					let thrown = err.value
+					reason = (thrown.invoke("getMessage") onerror recover thrown).str() unless thrown is none
+				}
+				recover try java.null()
+			}
+			assert message == "java: java.lang.IllegalStateException: no stock"
+			assert reason == "no stock" && trace.contains("at Sample.refuse(")
+			// An ADM error a function fails with comes back as it was.
+			let failing = try java.function(alwaysFails)
+			let code = ""
+			s.invoke("apply", failing, 1) onerror (err error) {
+				code = err.code
+				message = err.message
+				recover try java.null()
+			}
+			assert code == "out-of-stock" && message == "nothing left"
+			let wanted = 0
+			s.invoke("apply", failing, 1) onerror (err error) {
+				wanted = err.wanted when err is StockError
+				recover try java.null()
+			}
+			assert wanted == 1
+			// The same through a thread Java started.
+			code = ""
+			s.invoke("later", failing) onerror (err error) {
+				code = err.code
+				recover try java.null()
+			}
+			assert code == "out-of-stock"
+			// A Java exception a function lets through stays that exception.
+			let through = try java.function(def (args Value[]) !Value {
+				return try s.invoke("refuse", "inner")
+			})
+			message = ""
+			s.invoke("apply", through, 1) onerror (err error) {
+				message = err.message
+				recover try java.null()
+			}
+			assert message == "java: java.lang.IllegalStateException: inner"
+			return none
+		}
+
+		@test()
+		def java_holds_adm_objects() !none {
+			try sample()
+			let java = runtime()
+			let s = try java.load("Sample")
+			let held = try java.foreign(Parcel{label: "books", weight: 12})
+			assert held.kind() == Kind.Foreign
+			let back = try s.invoke("echo", held)
+			assert back.kind() == Kind.Foreign && back.same(held)
+			let obj = back.foreign()
+			fail "the object is gone" when obj is none
+			let weight = 0
+			weight = obj.weight when obj is Parcel
+			assert weight == 12
+			// A struct given as an argument crosses the same way.
+			let again = try s.invoke("echo", Parcel{label: "pens", weight: 1})
+			assert again.kind() == Kind.Foreign
+			assert (try java.value(3)).foreign() is none
+			return none
+		}
+
+		@test()
+		def forgets_what_is_dropped() !none {
+			try sample()
+			let java = runtime()
+			java.collect()
+			let before = java.live()
+			try fill(java)
+			// Dropped handles travel with the next request.
+			let after = java.live()
+			assert after == before
+			assert java.memory() > 0
+			let kept = machine.counts.len()
+			try lend(java)
+			let left = kept + 1
+			for let i = 0; i < 50 && left > kept; i++ {
+				java.collect()
+				left = machine.counts.len()
+			}
+			assert left == kept
+			return none
+		}
+	}
+
+	internal def shout_unused(args Value[]) !Value {
+		return args[0]
+	}
+
+	internal def alwaysFails(args Value[]) !Value {
+		fail StockError{message: "nothing left", code: "out-of-stock", wanted: args.len()}
+	}
+
+	// Makes and drops Java objects.
+	internal def fill(java Runtime) !none {
+		let lists = try java.load("java.util.ArrayList")
+		for let i = 0; i < 100; i++ {
+			let list = try lists.construct()
+			try list.invoke("add", i)
+		}
+		return none
+	}
+
+	// Gives Java a function and an object it drops again.
+	internal def lend(java Runtime) !none {
+		let s = try java.load("Sample")
+		try s.invoke("apply", try java.function(shout_unused), try java.foreign(Parcel{label: "x", weight: 1}))
+		return none
+	}
+}

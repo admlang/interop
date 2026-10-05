@@ -1,0 +1,227 @@
+partial module adm.interop.java {
+	use (
+		adm.interop.java.engine::*
+		std.reflection
+		std.reflection::(FieldKind)
+	)
+
+	// HostFunction is an ADM function Java calls. It gets the call's
+	// arguments and returns the result; an error it fails with is thrown in
+	// Java as a RuntimeException, and comes back unchanged if the Java code
+	// lets it through.
+	type HostFunction = def(Value[]) !Value
+
+	// Runtime is the Java VM of the program: the one of the Java
+	// installation JAVA_HOME names, else of the `java` on PATH, loaded when
+	// it is first used. A process has one, for as long as it runs; every
+	// Runtime is that VM, and runtime() gives it.
+	//
+	//     let java = runtime()
+	//     let list = try (try java.load("java.util.ArrayList")).construct()
+	//     try list.invoke("add", "ADM")
+	//     println(try (try list.invoke("size")).asInt())
+	//
+	// Any task may use it; calls into Java run one at a time, on a thread
+	// the VM owns. There is no source to evaluate: Java code comes compiled,
+	// from the class path.
+	type Runtime {
+		// Starts the VM with these folders and .jar files as its class path
+		// and these options (`-Xmx256m`, `-Dname=value`). Without a call to
+		// start, the first use starts it with the class path of the
+		// CLASSPATH variable, or the current folder.
+		// Fails with a ScriptError of kind Unavailable when no Java
+		// installation is found, when the VM refuses its options, and when
+		// the VM already runs.
+		def start(classPath string[] = [], options string[] = []) !none {
+			try machine.start(classPath, options, true)
+			return none
+		}
+
+		// A class or an interface as a value, by its name
+		// ("java.util.ArrayList", "java.util.Map.Entry", "int[]"): invoke()
+		// calls its static methods, get() and set() reach its static
+		// fields, construct() makes an instance.
+		// Fails with a ScriptError of kind Binding when the class is not on
+		// the class path.
+		def load(className string) !Value {
+			let out byte[]
+			out.push(byte(opLoad))
+			putString(out, className)
+			return readValue(try ask(out))
+		}
+
+		// A static field of a class.
+		// Fails with a ScriptError as load() does, and when the class has
+		// no such field.
+		def get(className string, name string) !Value {
+			let found = try load(className)
+			return try found.get(name)
+		}
+
+		// Java's null.
+		// Fails with a ScriptError when no Java VM can be started.
+		def null() !Value {
+			try machine.start(string[], string[], false)
+			return new Value(self, Kind.Null)
+		}
+
+		// A boolean.
+		// Fails with a ScriptError when no Java VM can be started.
+		def value(v bool) !Value {
+			try machine.start(string[], string[], false)
+			let out = new Value(self, Kind.Bool)
+			out.bits = v ?? (1, 0)
+			return out
+		}
+
+		// An integer: a long, or whichever integer type the method or field
+		// it is given to takes, when it fits.
+		// Fails with a ScriptError when no Java VM can be started.
+		def value(v int) !Value {
+			try machine.start(string[], string[], false)
+			let out = new Value(self, Kind.Integer)
+			out.bits = v
+			return out
+		}
+
+		// A double, or a float where one is taken and the value survives.
+		// Fails with a ScriptError when no Java VM can be started.
+		def value(v float) !Value {
+			try machine.start(string[], string[], false)
+			let out = new Value(self, Kind.Float)
+			out.number = v
+			return out
+		}
+
+		// A String.
+		// Fails with a ScriptError when no Java VM can be started.
+		def value(v string) !Value {
+			try machine.start(string[], string[], false)
+			let out = new Value(self, Kind.String)
+			out.chars = v
+			return out
+		}
+
+		// A Java byte[] holding a copy of these bytes.
+		// Fails with a ScriptError when no Java VM can be started.
+		def bytes(v byte[]) !Value {
+			return try value(v)
+		}
+
+		// Converts an ADM value: a Value stays itself, none is null,
+		// numbers, bools and strings convert, arrays become Java arrays
+		// (copied: byte[] and int8[] a byte[], int16[] a short[], int32[] an
+		// int[], int[] a long[], float32[] a float[], float[] a double[],
+		// bool[] a boolean[], string[] a String[], any other array an
+		// Object[]) and string-keyed maps a java.util.LinkedHashMap.
+		// Anything else, a struct or a type object, crosses as a Foreign
+		// value Java can hold and pass back but not look into.
+		// Fails with a ScriptError when no Java VM can be started.
+		def value(v any) !Value {
+			return try null() when v is none
+			return v when v is Value
+			return try value(v) when v is string
+			return try value(v) when v is int
+			return try value(v) when v is float
+			return try value(v) when v is bool
+			match reflection.kindOf(v) {
+				case FieldKind.Bool:
+					return try value(reflection.scalarText(v) == "true")
+				case FieldKind.Int, FieldKind.Uint, FieldKind.Enum:
+					return try value(reflection.scalarText(v).toInt<int>())
+				case FieldKind.Float:
+					return try value(parseFloat<float>(reflection.scalarText(v)))
+				case FieldKind.String:
+					return try value(reflection.scalarText(v))
+				case FieldKind.Array:
+					let out byte[]
+					out.push(byte(opValue))
+					let keep Value[]
+					try encodeArray(out, v, keep)
+					return readValue(try ask(out))
+				case FieldKind.Map:
+					let made = try (try load("java.util.LinkedHashMap")).construct()
+					for let key in reflection.keysOf(v) {
+						let e = reflection.entryOf(v, key)
+						try made.invoke("put", key, e) unless e is none
+					}
+					return made
+				default:
+					return try foreign(v) unless reflection.typeName(v) == "none"
+			}
+			return try null()
+		}
+
+		// An ADM function for Java. Without an interface name it becomes,
+		// each time it is given to a method, a constructor or a field, an
+		// object of the interface that one takes; with a name
+		// ("java.lang.Runnable", "java.util.function.Function") it is an
+		// object of that interface from the start. Every method of the
+		// interface runs fn with its arguments.
+		//
+		//     let byLength = try java.function(def (args Value[]) !Value {
+		//         return try java.value((try args[0].asString()).len() - (try args[1].asString()).len())
+		//     })
+		//     try list.invoke("sort", byLength)
+		// Fails with a ScriptError when no Java VM can be started, and of
+		// kind Binding when the name is not an interface on the class path.
+		def function(fn HostFunction, interfaceName string = "") !Value {
+			try machine.start(string[], string[], false)
+			reap()
+			let made = new Value(self, Kind.Function)
+			made.bits = machine.keepFunction(fn)
+			return made when interfaceName == ""
+			// The proxy holds the function from here on.
+			machine.retain(made.bits)
+			let out byte[]
+			out.push(byte(opProxy))
+			put64(out, made.bits)
+			putString(out, interfaceName)
+			return readValue(try ask(out))
+		}
+
+		// An opaque object standing for obj. Java can hold it and pass it
+		// back (Value.foreign() returns obj) but not look into it. obj
+		// stays alive while Java holds the object.
+		// Fails with a ScriptError when no Java VM can be started.
+		def foreign(obj any) !Value {
+			try machine.start(string[], string[], false)
+			reap()
+			let out byte[]
+			out.push(byte(opForeign))
+			put64(out, machine.keepObject(obj))
+			return readValue(try ask(out))
+		}
+
+		// Bytes of the Java heap in use; 0 before the VM starts.
+		def memory() int {
+			return stats(0)
+		}
+
+		// Java objects the program holds through values.
+		def live() int {
+			return stats(1)
+		}
+
+		// Asks the VM for a garbage collection now, and forgets the ADM
+		// functions and objects Java has dropped.
+		def collect() {
+			return unless machine.isRunning()
+			exchange(byte[opCollect]) onerror recover byte[]
+			reap()
+		}
+	}
+
+	// Entry `at` of what the bridge counts: heap bytes, held objects.
+	internal def stats(at int) int {
+		return 0 unless machine.isRunning()
+		let failed = false
+		let r = ask(byte[opStats]) onerror (err error) {
+			failed = true
+			recover new Reader(byte[])
+		}
+		return 0 when failed
+		let heap = r.i64()
+		return at == 0 ?? (heap, r.i64())
+	}
+}

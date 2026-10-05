@@ -1,0 +1,56 @@
+partial module adm.interop.java {
+	use std.errors
+
+	// What a Java value is.
+	enum Kind {
+		Null,
+		// A boolean or a Boolean.
+		Bool,
+		// A byte, short, int or long, or one of their boxes.
+		Integer,
+		// A float or a double, or one of their boxes.
+		Float,
+		// A String or a char.
+		String,
+		Array,
+		// Any other object.
+		Object,
+		// A class or an interface, whose static members and constructors
+		// the value gives.
+		Class,
+		// An ADM function Java has not been given yet; it becomes an object
+		// of the interface it is passed as.
+		Function,
+		// An ADM object Java holds without seeing inside it.
+		Foreign
+	}
+
+	// Why a call into Java failed.
+	enum ScriptFailure {
+		// The Java code threw.
+		Thrown,
+		// A class or a member was not found, or no method takes the
+		// arguments.
+		Binding,
+		// No Java VM could be started.
+		Unavailable,
+		// A value was not what the caller asked for.
+		Conversion
+	}
+
+	// ScriptError is the failure of a call into Java or of a conversion. A
+	// handler that narrows with `err is ScriptError` reads `kind`, the Java
+	// stack trace (`trace`) and the exception itself.
+	struct ScriptError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ScriptFailure
+		// The stack trace as Java prints it; "" when nothing was thrown.
+		trace   string
+		// The exception Java threw; none for failures that are not
+		// exceptions.
+		value   ?Value
+	}
+}

@@ -1,0 +1,904 @@
+internal partial module adm.interop.wasm.engine {
+	use (
+		adm.interop.wasm::*
+		std.mem
+	)
+
+	// Runs the code of `st` from `entry` with the frame at stack slot
+	// `frame`, until the function entered there returns.
+	//
+	// An instruction is op | a << 16 | b << 32 | c << 48, its operands frame
+	// slots; the one it writes is a. Plain WebAssembly instructions keep
+	// their opcode, the 0xfc ones are 0x100 up; the rest are internal
+	// (codes.adm).
+	def execute(st Machine, entry int, frame int) !none {
+		let code = st.code
+		let pool = st.pool
+		let s = st.stack
+		let calls = st.calls
+		let globals = st.globals
+		// The calls in progress: three words each, the caller's next
+		// instruction, frame and memory.
+		let depth = st.callTop
+		let sp = depth
+		let pc = entry
+		let fp = frame
+		// The memory of the function running, and its number.
+		let memory = -1
+		let m byte[]
+		for {
+			let w = code[pc]
+			pc++
+			let a = fp + ((w >> 16) & 0xffff)
+			let b = fp + ((w >> 32) & 0xffff)
+			let c = fp + ((w >> 48) & 0xffff)
+			match w & 0xffff {
+				case 0x300:
+					s[a] = s[b]
+				case 0x301:
+					s[a] = s[b]
+					s[a + 1] = s[b + 1]
+				case 0x302:
+					s[a] = code[pc]
+					pc++
+				case 0x303:
+					pc = w >> 16
+				case 0x304:
+					pc = (w >> 32) & 0xffffffff when s[a] != 0
+				case 0x305:
+					pc = (w >> 32) & 0xffffffff when s[a] == 0
+				case 0x306:
+					// br_table: the targets follow, the default one last.
+					let i = s[a] & 0xffffffff
+					let n = (w >> 32) & 0xffffffff
+					pc = code[pc + (i < n ?? (i, n))]
+				case 0x307:
+					// A call: the callee's frame starts at its arguments.
+					if sp + 3 > calls.len() {
+						fail exhausted("call stack exhausted") when sp >= st.maxCalls
+						calls.len((calls.len() * 2).max(1024))
+					}
+					calls[sp] = pc
+					calls[sp + 1] = fp
+					calls[sp + 2] = memory
+					sp += 3
+					fp = a
+					pc = (w >> 32) & 0xffffffff
+				case 0x308:
+					let id = (w >> 32) & 0xffffffff
+					let target = st.entries[id]
+					if target >= 0 {
+						if sp + 3 > calls.len() {
+							fail exhausted("call stack exhausted") when sp >= st.maxCalls
+							calls.len((calls.len() * 2).max(1024))
+						}
+						calls[sp] = pc
+						calls[sp + 1] = fp
+						calls[sp + 2] = memory
+						sp += 3
+						fp = a
+						pc = target
+					} else {
+						st.callTop = sp
+						try st.callHost(id, a)
+					}
+				case 0x309:
+					// call_indirect: the table and the type follow.
+					let k = code[pc]
+					pc++
+					let elements = st.tables[k & 0xffffffff].elements
+					let i = s[b] & 0xffffffff
+					fail trap("undefined element") when i >= elements.len()
+					let id = elements[i] - 1
+					fail trap("uninitialized element {i}") when id < 0
+					fail trap("indirect call type mismatch") unless st.signatures[id] == k >> 32
+					let target = st.entries[id]
+					if target >= 0 {
+						if sp + 3 > calls.len() {
+							fail exhausted("call stack exhausted") when sp >= st.maxCalls
+							calls.len((calls.len() * 2).max(1024))
+						}
+						calls[sp] = pc
+						calls[sp + 1] = fp
+						calls[sp + 2] = memory
+						sp += 3
+						fp = a
+						pc = target
+					} else {
+						st.callTop = sp
+						try st.callHost(id, a)
+					}
+				case 0x30a:
+					// A function's entry: a is the end of its frame, b to c
+					// its locals, which start as zero, then come its
+					// constants; the memory of its module follows.
+					try st.reserve(a) when a > s.len()
+					for let i = b; i < c; i++ {
+						s[i] = 0
+					}
+					let k = code[pc]
+					let from = k >> 8
+					for let i = 0; i < (k & 0xff); i++ {
+						s[c + i] = pool[from + i]
+					}
+					let own = code[pc + 1] - 1
+					pc += 2
+					if own >= 0 && own != memory {
+						memory = own
+						m = st.memories[own].bytes
+					}
+				case 0x30b:
+					return none when sp == depth
+					sp -= 3
+					pc = calls[sp]
+					fp = calls[sp + 1]
+					let own = calls[sp + 2]
+					if own >= 0 && own != memory {
+						memory = own
+						m = st.memories[own].bytes
+					}
+				case 0x30c:
+					fail trap("unreachable") when a == fp
+					fail exhausted("the function needs more than a frame holds")
+				case 0x30d:
+					st.fuel -= (w >> 16) & 0xffff
+					fail exhausted("out of fuel") when st.fuel < 0
+				case 0x30e:
+					// select of a v128: the condition's slot follows.
+					let from = s[fp + code[pc]] != 0 ?? (b, c)
+					pc++
+					let low = s[from]
+					s[a + 1] = s[from + 1]
+					s[a] = low
+				case 0x30f:
+					s[a] = code[pc]
+					s[a + 1] = code[pc + 1]
+					pc += 2
+				case 0x310:
+					let g = (w >> 32) & 0xffffffff
+					s[a] = globals[g]
+					s[a + 1] = globals[g + 1]
+				case 0x311:
+					let g = (w >> 32) & 0xffffffff
+					globals[g] = s[a]
+					globals[g + 1] = s[a + 1]
+				case 0x1b:
+					// select: the condition's slot follows.
+					s[a] = s[fp + code[pc]] != 0 ?? (s[b], s[c])
+					pc++
+				case 0x23:
+					s[a] = globals[(w >> 32) & 0xffffffff]
+				case 0x24:
+					globals[(w >> 32) & 0xffffffff] = s[a]
+				case 0x25:
+					let elements = st.tables[code[pc]].elements
+					pc++
+					let i = s[b] & 0xffffffff
+					fail trap("out of bounds table access") when i >= elements.len()
+					s[a] = elements[i]
+				case 0x26:
+					let elements = st.tables[code[pc]].elements
+					pc++
+					let i = s[a] & 0xffffffff
+					fail trap("out of bounds table access") when i >= elements.len()
+					elements[i] = s[b]
+				case 0x28, 0x34:
+					// The loads: the offset follows.
+					let at = (s[b] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 4 > m.len()
+					s[a] = int(int32(read32(m, at)))
+				case 0x29, 0x2b:
+					let at = (s[b] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 8 > m.len()
+					s[a] = read64(m, at)
+				case 0x2a, 0x35:
+					let at = (s[b] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 4 > m.len()
+					s[a] = read32(m, at)
+				case 0x2c, 0x30:
+					let at = (s[b] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at >= m.len()
+					s[a] = (int(m[at]) ^ 0x80) - 0x80
+				case 0x2d, 0x31:
+					let at = (s[b] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at >= m.len()
+					s[a] = int(m[at])
+				case 0x2e, 0x32:
+					let at = (s[b] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 2 > m.len()
+					s[a] = (read16(m, at) ^ 0x8000) - 0x8000
+				case 0x2f, 0x33:
+					let at = (s[b] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 2 > m.len()
+					s[a] = read16(m, at)
+				case 0x36, 0x38, 0x3e:
+					// The stores: a is the address, b the value.
+					let at = (s[a] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 4 > m.len()
+					write32(m, at, s[b])
+				case 0x37, 0x39:
+					let at = (s[a] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 8 > m.len()
+					write64(m, at, s[b])
+				case 0x3a, 0x3c:
+					let at = (s[a] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at >= m.len()
+					m[at] = byte(s[b] & 0xff)
+				case 0x3b, 0x3d:
+					let at = (s[a] & 0xffffffff) + code[pc]
+					pc++
+					fail trap("out of bounds memory access") when at + 2 > m.len()
+					write16(m, at, s[b])
+				case 0x3f:
+					s[a] = m.len() >> 16
+				case 0x40:
+					// memory.grow gives the old size in pages, -1 when it cannot.
+					let grown = st.memories[memory]
+					let old = m.len() >> 16
+					let pages = old + (s[b] & 0xffffffff)
+					if pages > (grown.bounded ?? (grown.max, 65536)) {
+						s[a] = -1
+					} else {
+						if pages > old {
+							m.len(pages << 16)
+							mem.setN(m[old << 16:], byte(0), (pages - old) << 16)
+						}
+						s[a] = old
+					}
+				case 0xd1:
+					s[a] = s[b] == 0 ?? (1, 0)
+				case 0x108:
+					// memory.init: the data segment follows.
+					let segment = code[pc]
+					pc++
+					let to = s[a] & 0xffffffff
+					let from = s[b] & 0xffffffff
+					let n = s[c] & 0xffffffff
+					let start = st.dataFrom[segment]
+					fail trap("out of bounds memory access") when from + n > st.dataTo[segment] - start || to + n > m.len()
+					mem.moveN(m[to:], st.dataBytes[segment][start + from:], n) when n > 0
+				case 0x109:
+					let segment = w >> 16
+					st.dataTo[segment] = st.dataFrom[segment]
+				case 0x10a:
+					let to = s[a] & 0xffffffff
+					let from = s[b] & 0xffffffff
+					let n = s[c] & 0xffffffff
+					fail trap("out of bounds memory access") when from + n > m.len() || to + n > m.len()
+					mem.moveN(m[to:], m[from:], n) when n > 0
+				case 0x10b:
+					let to = s[a] & 0xffffffff
+					let n = s[c] & 0xffffffff
+					fail trap("out of bounds memory access") when to + n > m.len()
+					mem.setN(m[to:], byte(s[b] & 0xff), n) when n > 0
+				case 0x10c:
+					// table.init: the element segment and the table follow.
+					let k = code[pc]
+					pc++
+					let segment = st.elems[k & 0xffffffff]
+					let elements = st.tables[k >> 32].elements
+					let to = s[a] & 0xffffffff
+					let from = s[b] & 0xffffffff
+					let n = s[c] & 0xffffffff
+					fail trap("out of bounds table access") when from + n > segment.len() || to + n > elements.len()
+					for let i = 0; i < n; i++ {
+						elements[to + i] = segment[from + i]
+					}
+				case 0x10d:
+					st.elems[w >> 16] = st.nothing
+				case 0x10e:
+					// table.copy: the two tables follow.
+					let k = code[pc]
+					pc++
+					let into = st.tables[k & 0xffffffff].elements
+					let source = st.tables[k >> 32].elements
+					let to = s[a] & 0xffffffff
+					let from = s[b] & 0xffffffff
+					let n = s[c] & 0xffffffff
+					fail trap("out of bounds table access") when from + n > source.len() || to + n > into.len()
+					if to <= from {
+						for let i = 0; i < n; i++ {
+							into[to + i] = source[from + i]
+						}
+					} else {
+						for let i = n - 1; i >= 0; i-- {
+							into[to + i] = source[from + i]
+						}
+					}
+				case 0x10f:
+					// table.grow: b is the value of the new elements, c
+					// their count.
+					let grown = st.tables[code[pc]]
+					pc++
+					let old = grown.elements.len()
+					let size = old + (s[c] & 0xffffffff)
+					if size > (grown.bounded ?? (grown.max, 0xffffffff)) || size > st.maxTable {
+						s[a] = -1
+					} else {
+						let value = s[b]
+						grown.elements.len(size)
+						for let i = old; i < size; i++ {
+							grown.elements[i] = value
+						}
+						s[a] = old
+					}
+				case 0x110:
+					s[a] = st.tables[(w >> 32) & 0xffffffff].elements.len()
+				case 0x111:
+					let elements = st.tables[code[pc]].elements
+					pc++
+					let to = s[a] & 0xffffffff
+					let n = s[c] & 0xffffffff
+					fail trap("out of bounds table access") when to + n > elements.len()
+					for let i = 0; i < n; i++ {
+						elements[to + i] = s[b]
+					}
+				case 0x45:
+					// i32.eqz, then the i32 comparisons
+					s[a] = s[b] == 0 ?? (1, 0)
+				case 0x46:
+					s[a] = s[b] == s[c] ?? (1, 0)
+				case 0x47:
+					s[a] = s[b] != s[c] ?? (1, 0)
+				case 0x48:
+					s[a] = s[b] < s[c] ?? (1, 0)
+				case 0x49:
+					s[a] = (s[b] & 0xffffffff) < (s[c] & 0xffffffff) ?? (1, 0)
+				case 0x4a:
+					s[a] = s[b] > s[c] ?? (1, 0)
+				case 0x4b:
+					s[a] = (s[b] & 0xffffffff) > (s[c] & 0xffffffff) ?? (1, 0)
+				case 0x4c:
+					s[a] = s[b] <= s[c] ?? (1, 0)
+				case 0x4d:
+					s[a] = (s[b] & 0xffffffff) <= (s[c] & 0xffffffff) ?? (1, 0)
+				case 0x4e:
+					s[a] = s[b] >= s[c] ?? (1, 0)
+				case 0x4f:
+					s[a] = (s[b] & 0xffffffff) >= (s[c] & 0xffffffff) ?? (1, 0)
+				case 0x50:
+					// i64.eqz, then the i64 comparisons
+					s[a] = s[b] == 0 ?? (1, 0)
+				case 0x51:
+					s[a] = s[b] == s[c] ?? (1, 0)
+				case 0x52:
+					s[a] = s[b] != s[c] ?? (1, 0)
+				case 0x53:
+					s[a] = s[b] < s[c] ?? (1, 0)
+				case 0x54:
+					s[a] = uint64(s[b]) < uint64(s[c]) ?? (1, 0)
+				case 0x55:
+					s[a] = s[b] > s[c] ?? (1, 0)
+				case 0x56:
+					s[a] = uint64(s[b]) > uint64(s[c]) ?? (1, 0)
+				case 0x57:
+					s[a] = s[b] <= s[c] ?? (1, 0)
+				case 0x58:
+					s[a] = uint64(s[b]) <= uint64(s[c]) ?? (1, 0)
+				case 0x59:
+					s[a] = s[b] >= s[c] ?? (1, 0)
+				case 0x5a:
+					s[a] = uint64(s[b]) >= uint64(s[c]) ?? (1, 0)
+				case 0x5b:
+					// The f32 comparisons
+					s[a] = f32(s[b]) == f32(s[c]) ?? (1, 0)
+				case 0x5c:
+					s[a] = f32(s[b]) != f32(s[c]) ?? (1, 0)
+				case 0x5d:
+					s[a] = f32(s[b]) < f32(s[c]) ?? (1, 0)
+				case 0x5e:
+					s[a] = f32(s[b]) > f32(s[c]) ?? (1, 0)
+				case 0x5f:
+					s[a] = f32(s[b]) <= f32(s[c]) ?? (1, 0)
+				case 0x60:
+					s[a] = f32(s[b]) >= f32(s[c]) ?? (1, 0)
+				case 0x61:
+					// The f64 comparisons
+					s[a] = f64(s[b]) == f64(s[c]) ?? (1, 0)
+				case 0x62:
+					s[a] = f64(s[b]) != f64(s[c]) ?? (1, 0)
+				case 0x63:
+					s[a] = f64(s[b]) < f64(s[c]) ?? (1, 0)
+				case 0x64:
+					s[a] = f64(s[b]) > f64(s[c]) ?? (1, 0)
+				case 0x65:
+					s[a] = f64(s[b]) <= f64(s[c]) ?? (1, 0)
+				case 0x66:
+					s[a] = f64(s[b]) >= f64(s[c]) ?? (1, 0)
+				case 0x67:
+					// i32: clz, ctz, popcnt, then the binary operators
+					s[a] = leadingZeros(s[b] & 0xffffffff) - 32
+				case 0x68:
+					s[a] = (s[b] & 0xffffffff) == 0 ?? (32, trailingZeros(s[b]))
+				case 0x69:
+					s[a] = ones(s[b] & 0xffffffff)
+				case 0x6a:
+					s[a] = int(int32(s[b] + s[c]))
+				case 0x6b:
+					s[a] = int(int32(s[b] - s[c]))
+				case 0x6c:
+					s[a] = int(int32(s[b] * s[c]))
+				case 0x6d:
+					fail trap("integer divide by zero") when s[c] == 0
+					fail trap("integer overflow") when s[b] == -2147483648 && s[c] == -1
+					s[a] = s[b] / s[c]
+				case 0x6e:
+					fail trap("integer divide by zero") when s[c] == 0
+					s[a] = int(int32((s[b] & 0xffffffff) / (s[c] & 0xffffffff)))
+				case 0x6f:
+					fail trap("integer divide by zero") when s[c] == 0
+					s[a] = s[c] == -1 ?? (0, s[b] % s[c])
+				case 0x70:
+					fail trap("integer divide by zero") when s[c] == 0
+					s[a] = int(int32((s[b] & 0xffffffff) % (s[c] & 0xffffffff)))
+				case 0x71:
+					s[a] = s[b] & s[c]
+				case 0x72:
+					s[a] = s[b] | s[c]
+				case 0x73:
+					s[a] = s[b] ^ s[c]
+				case 0x74:
+					s[a] = int(int32(s[b] << (s[c] & 31)))
+				case 0x75:
+					s[a] = s[b] >> (s[c] & 31)
+				case 0x76:
+					s[a] = int(int32((s[b] & 0xffffffff) >> (s[c] & 31)))
+				case 0x77:
+					s[a] = int(int32(uint32(s[b]) <<< uint32(s[c] & 31)))
+				case 0x78:
+					s[a] = int(int32(uint32(s[b]) >>> uint32(s[c] & 31)))
+				case 0x79:
+					// i64: clz, ctz, popcnt, then the binary operators
+					s[a] = leadingZeros(s[b])
+				case 0x7a:
+					s[a] = s[b] == 0 ?? (64, trailingZeros(s[b]))
+				case 0x7b:
+					s[a] = ones(s[b])
+				case 0x7c:
+					s[a] = s[b] + s[c]
+				case 0x7d:
+					s[a] = s[b] - s[c]
+				case 0x7e:
+					s[a] = s[b] * s[c]
+				case 0x7f:
+					fail trap("integer divide by zero") when s[c] == 0
+					fail trap("integer overflow") when s[b] == minInt && s[c] == -1
+					s[a] = s[b] / s[c]
+				case 0x80:
+					fail trap("integer divide by zero") when s[c] == 0
+					s[a] = int(uint64(s[b]) / uint64(s[c]))
+				case 0x81:
+					fail trap("integer divide by zero") when s[c] == 0
+					s[a] = s[c] == -1 ?? (0, s[b] % s[c])
+				case 0x82:
+					fail trap("integer divide by zero") when s[c] == 0
+					s[a] = int(uint64(s[b]) % uint64(s[c]))
+				case 0x83:
+					s[a] = s[b] & s[c]
+				case 0x84:
+					s[a] = s[b] | s[c]
+				case 0x85:
+					s[a] = s[b] ^ s[c]
+				case 0x86:
+					s[a] = s[b] << (s[c] & 63)
+				case 0x87:
+					s[a] = s[b] >> (s[c] & 63)
+				case 0x88:
+					s[a] = int(uint64(s[b]) >> uint64(s[c] & 63))
+				case 0x89:
+					s[a] = int(uint64(s[b]) <<< uint64(s[c] & 63))
+				case 0x8a:
+					s[a] = int(uint64(s[b]) >>> uint64(s[c] & 63))
+				case 0x8b:
+					// f32: abs, neg, ceil, floor, trunc, nearest, sqrt, then the binary operators
+					s[a] = s[b] & 0x7fffffff
+				case 0x8c:
+					s[a] = s[b] ^ 0x80000000
+				case 0x8d:
+					s[a] = bits32(float32(roundUp(float64(f32(s[b])))))
+				case 0x8e:
+					s[a] = bits32(float32(roundDown(float64(f32(s[b])))))
+				case 0x8f:
+					s[a] = bits32(float32(truncate(float64(f32(s[b])))))
+				case 0x90:
+					s[a] = bits32(float32(nearest(float64(f32(s[b])))))
+				case 0x91:
+					s[a] = bits32(float32(squareRoot(float64(f32(s[b])))))
+				case 0x92:
+					s[a] = bits32(f32(s[b]) + f32(s[c]))
+				case 0x93:
+					s[a] = bits32(f32(s[b]) - f32(s[c]))
+				case 0x94:
+					s[a] = bits32(f32(s[b]) * f32(s[c]))
+				case 0x95:
+					s[a] = bits32(f32(s[b]) / f32(s[c]))
+				case 0x96:
+					s[a] = bits32(float32(smaller(float64(f32(s[b])), float64(f32(s[c])))))
+				case 0x97:
+					s[a] = bits32(float32(larger(float64(f32(s[b])), float64(f32(s[c])))))
+				case 0x98:
+					s[a] = (s[b] & 0x7fffffff) | (s[c] & 0x80000000)
+				case 0x99:
+					// f64: abs, neg, ceil, floor, trunc, nearest, sqrt, then the binary operators
+					s[a] = s[b] & maxInt
+				case 0x9a:
+					s[a] = s[b] ^ minInt
+				case 0x9b:
+					s[a] = bits64(roundUp(f64(s[b])))
+				case 0x9c:
+					s[a] = bits64(roundDown(f64(s[b])))
+				case 0x9d:
+					s[a] = bits64(truncate(f64(s[b])))
+				case 0x9e:
+					s[a] = bits64(nearest(f64(s[b])))
+				case 0x9f:
+					s[a] = bits64(squareRoot(f64(s[b])))
+				case 0xa0:
+					s[a] = bits64(f64(s[b]) + f64(s[c]))
+				case 0xa1:
+					s[a] = bits64(f64(s[b]) - f64(s[c]))
+				case 0xa2:
+					s[a] = bits64(f64(s[b]) * f64(s[c]))
+				case 0xa3:
+					s[a] = bits64(f64(s[b]) / f64(s[c]))
+				case 0xa4:
+					s[a] = bits64(smaller(f64(s[b]), f64(s[c])))
+				case 0xa5:
+					s[a] = bits64(larger(f64(s[b]), f64(s[c])))
+				case 0xa6:
+					s[a] = (s[b] & maxInt) | (s[c] & minInt)
+				case 0xa7:
+					// The conversions
+					s[a] = int(int32(s[b]))
+				case 0xa8:
+					s[a] = try truncSigned32(float64(f32(s[b])))
+				case 0xa9:
+					s[a] = try truncUnsigned32(float64(f32(s[b])))
+				case 0xaa:
+					s[a] = try truncSigned32(f64(s[b]))
+				case 0xab:
+					s[a] = try truncUnsigned32(f64(s[b]))
+				case 0xac:
+					s[a] = s[b]
+				case 0xad:
+					s[a] = s[b] & 0xffffffff
+				case 0xae:
+					s[a] = try truncSigned64(float64(f32(s[b])))
+				case 0xaf:
+					s[a] = try truncUnsigned64(float64(f32(s[b])))
+				case 0xb0:
+					s[a] = try truncSigned64(f64(s[b]))
+				case 0xb1:
+					s[a] = try truncUnsigned64(f64(s[b]))
+				case 0xb2:
+					s[a] = bits32(float32(s[b]))
+				case 0xb3:
+					s[a] = bits32(float32(s[b] & 0xffffffff))
+				case 0xb4:
+					s[a] = bits32(float32(s[b]))
+				case 0xb5:
+					s[a] = bits32(float32(uint64(s[b])))
+				case 0xb6:
+					s[a] = bits32(float32(f64(s[b])))
+				case 0xb7:
+					s[a] = bits64(float64(s[b]))
+				case 0xb8:
+					s[a] = bits64(float64(s[b] & 0xffffffff))
+				case 0xb9:
+					s[a] = bits64(float64(s[b]))
+				case 0xba:
+					s[a] = bits64(float64(uint64(s[b])))
+				case 0xbb:
+					s[a] = bits64(float64(f32(s[b])))
+				case 0xbc:
+					s[a] = int(int32(s[b]))
+				case 0xbd, 0xbf:
+					s[a] = s[b]
+				case 0xbe:
+					s[a] = s[b] & 0xffffffff
+				case 0xc0, 0xc2:
+					s[a] = int(int8(s[b]))
+				case 0xc1, 0xc3:
+					s[a] = int(int16(s[b]))
+				case 0xc4:
+					s[a] = int(int32(s[b]))
+				case 0x100:
+					s[a] = saturateSigned32(float64(f32(s[b])))
+				case 0x101:
+					s[a] = saturateUnsigned32(float64(f32(s[b])))
+				case 0x102:
+					s[a] = saturateSigned32(f64(s[b]))
+				case 0x103:
+					s[a] = saturateUnsigned32(f64(s[b]))
+				case 0x104:
+					s[a] = saturateSigned64(float64(f32(s[b])))
+				case 0x105:
+					s[a] = saturateUnsigned64(float64(f32(s[b])))
+				case 0x106:
+					s[a] = saturateSigned64(f64(s[b]))
+				case 0x107:
+					s[a] = saturateUnsigned64(f64(s[b]))
+				case 0x400:
+					// A comparison and the branch on it, taken when it holds.
+					if s[a] == 0 {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x401:
+					if s[a] == s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x402:
+					if s[a] != s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x403:
+					if s[a] < s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x404:
+					if (s[a] & 0xffffffff) < (s[b] & 0xffffffff) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x405:
+					if s[a] > s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x406:
+					if (s[a] & 0xffffffff) > (s[b] & 0xffffffff) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x407:
+					if s[a] <= s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x408:
+					if (s[a] & 0xffffffff) <= (s[b] & 0xffffffff) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x409:
+					if s[a] >= s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x40a:
+					if (s[a] & 0xffffffff) >= (s[b] & 0xffffffff) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x40b:
+					if s[a] == 0 {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x40c:
+					if s[a] == s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x40d:
+					if s[a] != s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x40e:
+					if s[a] < s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x40f:
+					if uint64(s[a]) < uint64(s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x410:
+					if s[a] > s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x411:
+					if uint64(s[a]) > uint64(s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x412:
+					if s[a] <= s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x413:
+					if uint64(s[a]) <= uint64(s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x414:
+					if s[a] >= s[b] {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x415:
+					if uint64(s[a]) >= uint64(s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x420:
+					// A comparison and the branch on it, taken when it does not hold.
+					if !(s[a] == 0) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x421:
+					if !(s[a] == s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x422:
+					if !(s[a] != s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x423:
+					if !(s[a] < s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x424:
+					if !((s[a] & 0xffffffff) < (s[b] & 0xffffffff)) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x425:
+					if !(s[a] > s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x426:
+					if !((s[a] & 0xffffffff) > (s[b] & 0xffffffff)) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x427:
+					if !(s[a] <= s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x428:
+					if !((s[a] & 0xffffffff) <= (s[b] & 0xffffffff)) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x429:
+					if !(s[a] >= s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x42a:
+					if !((s[a] & 0xffffffff) >= (s[b] & 0xffffffff)) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x42b:
+					if !(s[a] == 0) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x42c:
+					if !(s[a] == s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x42d:
+					if !(s[a] != s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x42e:
+					if !(s[a] < s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x42f:
+					if !(uint64(s[a]) < uint64(s[b])) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x430:
+					if !(s[a] > s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x431:
+					if !(uint64(s[a]) > uint64(s[b])) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x432:
+					if !(s[a] <= s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x433:
+					if !(uint64(s[a]) <= uint64(s[b])) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x434:
+					if !(s[a] >= s[b]) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				case 0x435:
+					if !(uint64(s[a]) >= uint64(s[b])) {
+						pc = code[pc]
+					} else {
+						pc++
+					}
+				default:
+					fail trap("instruction {(w & 0xffff).hex()} is not supported") unless (w & 0xffff) >= 0x200 && (w & 0xffff) <= 0x2ff
+					pc = try vectorExecute(st, s, m, code, w, pc, fp)
+			}
+		}
+		return none
+	}
+}
