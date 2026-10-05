@@ -25,6 +25,9 @@ partial module adm.interop.js {
 		// The value's slot in the runtime, its kind in the top byte; 0 once
 		// released.
 		slot    int
+		// The array a view made by Runtime.lend reads, kept alive until the
+		// view ends.
+		backing ?any
 
 		def new(runtime Runtime, slot int) {
 			self.runtime = runtime
@@ -33,6 +36,7 @@ partial module adm.interop.js {
 
 		def dispose() {
 			return when slot == 0
+			detach() unless backing is none
 			aqjsRelease(runtime.engine.handle, slot)
 			slot = 0
 		}
@@ -277,9 +281,10 @@ partial module adm.interop.js {
 		}
 
 		// Ends a view made by Runtime.lend: the script sees it empty from
-		// here on, and the bytes behind it may go.
+		// here on, and the array behind it may go.
 		def detach() {
 			aqjsDetach(runtime.engine.handle, slot)
+			backing = none
 		}
 
 		// Converts call arguments; views made over byte[] arguments are added

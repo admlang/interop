@@ -422,12 +422,58 @@ partial module adm.interop.js {
 		}
 
 		// A Uint8Array over data itself, with no copy: the script reads and
-		// writes the caller's bytes. The caller keeps data alive and
-		// unresized, and calls detach() on the view when done; from then on
-		// the script sees an empty array.
+		// writes the caller's bytes. The view keeps data alive; the caller
+		// leaves it unresized until the view ends, which detach() or
+		// releasing the returned value does: from then on the script sees an
+		// empty array. The overloads lend numeric arrays
+		// the same way, each as the typed array of its element type; int[]
+		// and uint[] have none (their elements would be BigInts) and are
+		// copied by value().
 		// Fails with a ScriptError when the runtime is closed.
 		def lend(data byte[]) !Value {
-			return try wrap(self, aqjsView(engine.handle, data, data.len()))
+			return try lease(self, data, aqjsView(engine.handle, data, data.len()))
+		}
+
+		// An Int8Array over data itself, as lend(byte[]) lends bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data int8[]) !Value {
+			return try lease(self, data, aqjsViewInt8(engine.handle, data, data.len(), 1))
+		}
+
+		// An Int16Array over data itself, as lend(byte[]) lends bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data int16[]) !Value {
+			return try lease(self, data, aqjsViewInt16(engine.handle, data, data.len() * 2, 3))
+		}
+
+		// A Uint16Array over data itself, as lend(byte[]) lends bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data uint16[]) !Value {
+			return try lease(self, data, aqjsViewUint16(engine.handle, data, data.len() * 2, 4))
+		}
+
+		// An Int32Array over data itself, as lend(byte[]) lends bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data int32[]) !Value {
+			return try lease(self, data, aqjsViewInt32(engine.handle, data, data.len() * 4, 5))
+		}
+
+		// A Uint32Array over data itself, as lend(byte[]) lends bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data uint32[]) !Value {
+			return try lease(self, data, aqjsViewUint32(engine.handle, data, data.len() * 4, 6))
+		}
+
+		// A Float32Array over data itself, as lend(byte[]) lends bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data float32[]) !Value {
+			return try lease(self, data, aqjsViewFloat32(engine.handle, data, data.len() * 4, 10))
+		}
+
+		// A Float64Array over data itself, as lend(byte[]) lends bytes.
+		// Fails with a ScriptError when the runtime is closed.
+		def lend(data float[]) !Value {
+			return try lease(self, data, aqjsViewFloat64(engine.handle, data, data.len() * 8, 11))
 		}
 
 		// A function the script can call, running fn. name is what the script
@@ -492,6 +538,13 @@ partial module adm.interop.js {
 	internal def wrap(rt Runtime, slot int) !Value {
 		try raise(rt) when slot == 0
 		return new Value(rt, slot)
+	}
+
+	// Wraps the slot of a view over data, which the view keeps alive.
+	internal def lease(rt Runtime, data any, slot int) !Value {
+		let out = try wrap(rt, slot)
+		out.backing = data
+		return out
 	}
 
 	// Fails with the exception the last call put aside: the ADM error a

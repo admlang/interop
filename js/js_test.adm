@@ -325,6 +325,36 @@ partial module adm.interop.js {
 			assert data.hex() == "02040608"
 			assert try (try js.eval("kept.length")).asInt() == 0
 
+			let total = try js.eval("(xs) => \{ for (let i = 0; i < xs.length; i++) xs[i] *= 2; return xs.constructor.name + ':' + xs.reduce((a, b) => a + b) \}")
+			let samples float[] = [1.5, 2.5, 3.0]
+			let lentSamples = try js.lend(samples)
+			assert try (try total.call(lentSamples)).asString() == "Float64Array:14"
+			assert samples[0] == 3.0 && samples[2] == 6.0
+			lentSamples.detach()
+			assert try lentSamples.len() == 0
+			let narrow float32[] = [0.5, 0.25]
+			assert try (try total.call(try js.lend(narrow))).asString() == "Float32Array:1.5"
+			assert narrow[1] == 0.5
+			// A view keeps its array alive and ends with its value.
+			try (try js.global()).set("orphan", try js.lend(float[4.0, 5.0]))
+			js.collect()
+			assert try (try js.eval("orphan.length")).asInt() == 0
+			let small int8[] = [-1, 2]
+			assert try (try total.call(try js.lend(small))).asString() == "Int8Array:2"
+			assert small[0] == -2
+			let words int16[] = [-300, 2]
+			assert try (try total.call(try js.lend(words))).asString() == "Int16Array:-596"
+			assert words[0] == -600
+			let codes uint16[] = [40000, 1]
+			assert try (try total.call(try js.lend(codes))).asString() == "Uint16Array:14466"
+			assert codes[0] == 14464
+			let counts int32[] = [-70000, 1]
+			assert try (try total.call(try js.lend(counts))).asString() == "Int32Array:-139998"
+			assert counts[0] == -140000
+			let sizes uint32[] = [3000000000, 1]
+			assert try (try total.call(try js.lend(sizes))).asString() == "Uint32Array:1705032706"
+			assert sizes[0] == 1705032704
+
 			let lease = try js.lend(data)
 			try (try js.global()).set("shared", lease)
 			try js.eval("shared[0] = 255")

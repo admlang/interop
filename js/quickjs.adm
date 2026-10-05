@@ -87,6 +87,29 @@ internal module adm.interop.js.quickjs {
 	// A Uint8Array over the caller's bytes, no copy; aqjsDetach ends it.
 	def aqjsView(rt uint, data byte[], n int) int;
 
+	// A typed array over the caller's elements, no copy: `bytes` is their size
+	// in bytes, `kind` QuickJS's JSTypedArrayEnum for the element type.
+	@c(symbol = "aqjsViewAs")
+	def aqjsViewInt8(rt uint, data int8[], bytes int, kind int) int;
+
+	@c(symbol = "aqjsViewAs")
+	def aqjsViewInt16(rt uint, data int16[], bytes int, kind int) int;
+
+	@c(symbol = "aqjsViewAs")
+	def aqjsViewUint16(rt uint, data uint16[], bytes int, kind int) int;
+
+	@c(symbol = "aqjsViewAs")
+	def aqjsViewInt32(rt uint, data int32[], bytes int, kind int) int;
+
+	@c(symbol = "aqjsViewAs")
+	def aqjsViewUint32(rt uint, data uint32[], bytes int, kind int) int;
+
+	@c(symbol = "aqjsViewAs")
+	def aqjsViewFloat32(rt uint, data float32[], bytes int, kind int) int;
+
+	@c(symbol = "aqjsViewAs")
+	def aqjsViewFloat64(rt uint, data float[], bytes int, kind int) int;
+
 	// Detaches the buffer behind a view.
 	def aqjsDetach(rt uint, value int);
 
@@ -116,6 +139,15 @@ internal module adm.interop.js.quickjs {
 
 	// Whether a BigInt fits 64 bits.
 	def aqjsBigIntFits(rt uint, value int) bool;
+
+	// Copies the elements of an array or typed array into out as numbers, up
+	// to cap, and returns how many; -1 when reading threw or an element is
+	// not a number.
+	def aqjsNumbers(rt uint, value int, out float[], cap int) int;
+
+	// The same for integers: numbers with no fraction, or BigInts that fit
+	// 64 bits.
+	def aqjsIntegers(rt uint, value int, out int[], cap int) int;
 
 	// String(value) as a blob; 0 when it threw.
 	def aqjsText(rt uint, value int) uint;

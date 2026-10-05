@@ -20,9 +20,6 @@ brings foreign code; official `admlang` packages are accepted without the questi
 
 ## Binding a script to ADM functions
 
-> Not available yet. This is where the library is going; until then, use the engine directly
-> (next section).
-
 Write the script as an ordinary ES module:
 
 ```js
@@ -32,7 +29,7 @@ export function total(items) {
 }
 ```
 
-Declare its functions in ADM and call them like any other:
+Declare its functions in ADM, without a body, and call them like any other:
 
 ```adm
 module billing {
@@ -51,6 +48,23 @@ module billing {
 ```adm
 let due = try billing.total(cart)
 ```
+
+- The file is named relative to the source file and is embedded in the program when it is built;
+  nothing is read at run time. Each declaration is the export of the same name.
+- A script that throws fails the call with a `ScriptError`. Declare the function errorable (`!T`)
+  to handle it; a declaration that cannot fail panics instead.
+- Arguments: numbers, bools and strings convert; structs are copied into plain objects, field by
+  field; `byte[]` and the numeric arrays `lend` takes arrive as typed arrays over the caller's own
+  array, so what the script writes is written there; other arrays and maps are copied.
+- Results: `bool`, any numeric type, `string`, `byte[]`, arrays of those, a struct (filled from
+  an object: each field takes the property of the same name, nested structs, arrays and maps
+  included), an array of structs, a `map<string, V>`, `Value` for the script's value as it is, or
+  nothing. `?T` takes `null` and `undefined` as `none`. A number that does not fit the declared
+  type, or a property of the wrong kind, fails the call. A promise is waited for, so an `async`
+  export works.
+- Every declaration runs in one engine, `js.runtime()`. Give scripts their host functions through
+  its global object before the first call (see "Calling ADM from a script").
+- A script file cannot import another file yet.
 
 ## Using the engine directly
 
@@ -151,6 +165,7 @@ rt.eval("JSON.parse('not json')") onerror (err error) {
 |---|---|
 | `Runtime` | One engine with its own heap, globals and modules. `eval`, `define`/`load`/`get` for ES modules, `compile`/`run` for bytecode, `function` for ADM functions scripts can call, `value`/`copy`/`bytes`/`lend`/`foreign`/`object`/`array`/`parse` to make values, `runJobs`, `interrupt`, `timeout`, `memory`, `collect`, `close`. |
 | `Value` | A JavaScript value held by ADM. `kind`, `asBool`/`asInt`/`asFloat`/`asString`/`asBytes`, `text`, `json`, `get`/`set`/`has`/`remove`/`keys`/`len`, `call`/`invoke`/`construct`, `state`/`wait` for promises, `foreign`, `same`, `detach`. |
+| `@js("file.js")` | Binds a function declared without a body to the export of the same name in an embedded script file. `runtime()` is the engine those declarations run in. |
 | `ScriptError` | What a failing script fails with: `kind` (`Thrown`, `Interrupted`, `TimedOut`, `OutOfMemory`, `Closed`, `Conversion`), the JavaScript error's `name`, its stack (`trace`) and the thrown `value`. |
 | `HostFunction` | `def(Value[]) !Value`, an ADM function a script calls. |
 
@@ -163,6 +178,7 @@ Every declaration is documented in the source; `adm doc --module adm.interop.js`
 | `bool`, `float`, `string` | boolean, number, string |
 | `int` | number, or BigInt beyond 2^53. `asInt` reads both back and fails on a fraction or an overflow |
 | `byte[]` | `Uint8Array`. Copied by `bytes` and `value`. Passed as a call argument it is lent without a copy and is empty again when the call returns; `lend` does the same until `detach` |
+| `int8[]`, `int16[]`, `uint16[]`, `int32[]`, `uint32[]`, `float32[]`, `float[]` | array (copied) by `value` and as a call argument; `lend` gives the script the matching typed array (`Int8Array` … `Float64Array`) over the array itself, with no copy, until `detach` or until the returned value is released |
 | other arrays, `map<string, V>` | array, object (copied) |
 | `none` | `null` |
 | struct, type object | an opaque object the script can hold and pass back (`Value.foreign()` returns it); `copy` makes a plain object of its fields instead |

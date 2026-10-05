@@ -731,21 +731,27 @@ int64_t aqjsBytes(Aqjs* r, const uint8_t* data, int64_t len) {
     return h;
 }
 
-// A Uint8Array over the caller's own bytes, with no copy. The caller keeps
-// the bytes alive and calls aqjsDetach before they go.
-int64_t aqjsView(Aqjs* r, uint8_t* data, int64_t len) {
+// A typed array of `kind` (a JSTypedArrayEnum) over the caller's own elements,
+// with no copy; `len` is their size in bytes. The caller keeps them alive and
+// calls aqjsDetach before they go.
+int64_t aqjsViewAs(Aqjs* r, void* data, int64_t len, int64_t kind) {
     int64_t h = 0;
     if (enter(r)) {
         JSValue buf = JS_NewArrayBuffer(r->ctx, data, (size_t)len, 0, NULL, NULL, false);
         if (JS_IsException(buf)) {
             set_exception(r);
         } else {
-            h = put(r, JS_NewTypedArray(r->ctx, 1, &buf, JS_TYPED_ARRAY_UINT8));
+            h = put(r, JS_NewTypedArray(r->ctx, 1, &buf, (JSTypedArrayEnum)kind));
             JS_FreeValue(r->ctx, buf);
         }
     }
     leave(r);
     return h;
+}
+
+// A Uint8Array over the caller's own bytes.
+int64_t aqjsView(Aqjs* r, uint8_t* data, int64_t len) {
+    return aqjsViewAs(r, data, len, JS_TYPED_ARRAY_UINT8);
 }
 
 // Detaches the buffer behind a view: the script sees it empty from here on.
@@ -875,6 +881,106 @@ bool aqjsBigIntFits(Aqjs* r, int64_t h) {
     }
     leave(r);
     return fits;
+}
+
+// Reads element i of an array or typed array as a number. False after
+// throwing a TypeError when it is not one.
+static bool number_at(Aqjs* r, JSValueConst arr, int64_t i, double* out) {
+    JSValue e = JS_GetPropertyInt64(r->ctx, arr, i);
+    if (JS_IsException(e)) return false;
+    int tag = JS_VALUE_GET_NORM_TAG(e);
+    bool ok = true;
+    if (tag == JS_TAG_INT) {
+        *out = JS_VALUE_GET_INT(e);
+    } else if (tag == JS_TAG_FLOAT64) {
+        *out = JS_VALUE_GET_FLOAT64(e);
+    } else {
+        JS_ThrowTypeError(r->ctx, "element %lld is not a number", (long long)i);
+        ok = false;
+    }
+    JS_FreeValue(r->ctx, e);
+    return ok;
+}
+
+// Copies the elements of an array or typed array into out as numbers, up to
+// cap of them, and returns how many it copied; -1 when reading threw or an
+// element is not a number.
+int64_t aqjsNumbers(Aqjs* r, int64_t h, double* out, int64_t cap) {
+    int64_t n = -1;
+    if (enter(r)) {
+        JSValueConst arr = at(r, h);
+        int64_t len = 0;
+        if (JS_GetLength(r->ctx, arr, &len) < 0) {
+            set_exception(r);
+        } else {
+            n = len < cap ? len : cap;
+            for (int64_t i = 0; i < n; i++) {
+                if (!number_at(r, arr, i, &out[i])) {
+                    set_exception(r);
+                    n = -1;
+                    break;
+                }
+            }
+        }
+    }
+    leave(r);
+    return n;
+}
+
+// The same for integers: each element a number with no fraction that a
+// double holds exactly, or a BigInt that fits 64 bits.
+int64_t aqjsIntegers(Aqjs* r, int64_t h, int64_t* out, int64_t cap) {
+    int64_t n = -1;
+    if (enter(r)) {
+        JSValueConst arr = at(r, h);
+        int64_t len = 0;
+        if (JS_GetLength(r->ctx, arr, &len) < 0) {
+            set_exception(r);
+            leave(r);
+            return -1;
+        }
+        n = len < cap ? len : cap;
+        for (int64_t i = 0; i < n; i++) {
+            JSValue e = JS_GetPropertyInt64(r->ctx, arr, i);
+            bool ok = !JS_IsException(e);
+            if (ok) {
+                int tag = JS_VALUE_GET_NORM_TAG(e);
+                if (tag == JS_TAG_INT) {
+                    out[i] = JS_VALUE_GET_INT(e);
+                } else if (tag == JS_TAG_FLOAT64) {
+                    double d = JS_VALUE_GET_FLOAT64(e);
+                    if (d != d || d != (double)(int64_t)d || d > 9007199254740992.0 || d < -9007199254740992.0) {
+                        JS_ThrowRangeError(r->ctx, "element %lld is not an integer", (long long)i);
+                        ok = false;
+                    } else {
+                        out[i] = (int64_t)d;
+                    }
+                } else if (tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT) {
+                    JSValue back = JS_UNDEFINED;
+                    ok = JS_ToBigInt64(r->ctx, &out[i], e) == 0;
+                    if (ok) {
+                        back = JS_NewBigInt64(r->ctx, out[i]);
+                        if (!JS_IsStrictEqual(r->ctx, back, e)) {
+                            JS_ThrowRangeError(r->ctx, "element %lld does not fit 64 bits", (long long)i);
+                            ok = false;
+                        }
+                        JS_FreeValue(r->ctx, back);
+                    }
+                } else {
+                    JS_ThrowTypeError(r->ctx, "element %lld is not a number", (long long)i);
+                    ok = false;
+                }
+                JS_FreeValue(r->ctx, e);
+            }
+            if (!ok) {
+                set_exception(r);
+                n = -1;
+                break;
+            }
+        }
+    }
+    leave(r);
+    return n;
 }
 
 // The value as text (String(v)) in a blob; NULL when the conversion threw.
