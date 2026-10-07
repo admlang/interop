@@ -76,3 +76,7 @@ to = "quickjs/adm_qjs.c"
 [[package.files]]
 from = "quickjs/LICENSE"
 to = "quickjs/LICENSE"
+
+# The line `adm search` shows for the library; `adm publish` files it.
+[apps."adm.interop.js"]
+description = "JS interop library"
